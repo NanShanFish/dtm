@@ -1,0 +1,6 @@
+# Variables are plain YAML scalars. They may use ${home}, ${root}, or
+# another variable from this mapping. Both predefined variables can be overridden.
+variables:
+  config_home: ${home}/.config
+  local_bin: ${home}/.local/bin
+  system_config: ${root}/etc/dtm
