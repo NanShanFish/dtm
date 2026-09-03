@@ -1,0 +1,6 @@
+[user]
+	name = DTM Interactive Test
+	email = dtm-test@example.invalid
+
+[core]
+	autocrlf = false

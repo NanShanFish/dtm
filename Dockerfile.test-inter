@@ -1,0 +1,25 @@
+FROM debian:bookworm-slim
+
+ARG USER_NAME=dtm
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd --gid "${USER_GID}" "${USER_NAME}" \
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
+        --shell /bin/bash "${USER_NAME}"
+
+COPY target/release/dtm /usr/local/bin/dtm
+COPY test/fixtures/home/ /home/${USER_NAME}/
+
+RUN chmod 0755 /usr/local/bin/dtm \
+    && chown --recursive "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}"
+
+ENV HOME=/home/dtm \
+    USER=dtm \
+    LOGNAME=dtm \
+    PATH=/usr/local/bin:/usr/bin:/bin
+
+WORKDIR /home/dtm
+USER dtm
+
+CMD ["/bin/bash", "--login"]

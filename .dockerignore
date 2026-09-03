@@ -1,0 +1,9 @@
+.git
+.gitignore
+Dockerfile*
+Makefile
+README.md
+target/*
+!target/release/
+target/release/*
+!target/release/dtm
