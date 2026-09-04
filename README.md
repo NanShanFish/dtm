@@ -29,7 +29,16 @@ To use another container engine or a different local image name:
 make test-inter CONTAINER_ENGINE=docker IMAGE=dtm-test-inter:debug
 ```
 
-## Configuration
+Run the scanner for one package:
+
+```sh
+dtm <PACKAGE>
+dtm --dot-dir /path/to/dotfiles <PACKAGE>
+```
+
+The command prints one tab-separated line per scanned file containing its source
+path, target path, and type (`symlink` or `template`).
+
 
 By default, `dtm` loads:
 
@@ -42,7 +51,6 @@ A different file can be selected with:
 
 ```sh
 dtm --config /path/to/config.yaml
-dtm --config=/path/to/config.yaml
 ```
 
 Configuration uses YAML. Variable values are plain scalars and support limited,
@@ -53,10 +61,19 @@ variables:
   config_home: ${home}/.config
   local_bin: ${home}/.local/bin
   system_config: ${root}/etc/dtm
+  _dotfile_dir: ${home}/dotfiles
 ```
 
 `home` defaults to the current user's home directory. `root` defaults to the
-filesystem root (`/`). Both are normal variables and can be overridden in the
-configuration. A value may reference another declared variable, such as
-`${config_home}/dtm`. Unknown variables, malformed references, and reference
-cycles are rejected.
+filesystem root (`/`). `_dotfile_dir` defaults to the current working directory.
+All three are normal variables and can be overridden in the configuration. The
+`--dot-dir` command-line option has the highest priority and overrides the
+`_dotfile_dir` value from the configuration:
+
+```sh
+dtm --dot-dir /path/to/dotfiles
+```
+
+A value may reference another declared variable, such as
+`${_dotfile_dir}/packages`. Unknown variables, malformed references, and
+reference cycles are rejected.
