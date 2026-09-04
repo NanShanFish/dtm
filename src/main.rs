@@ -2,12 +2,12 @@ mod config;
 mod package;
 
 use config::Config;
-use package::{EntryKind, PackagePlan};
+use package::{ApplyMode, EntryKind, PackagePlan};
 use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "Usage: dtm [--config <PATH>] [--dot-dir <PATH>] <PACKAGE>";
+const USAGE: &str = "Usage: dtm [--config <PATH>] [--dot-dir <PATH>] [--semi-force | --force] [--dry-run] <PACKAGE>";
 
 fn main() {
     if let Err(error) = run() {
@@ -32,12 +32,26 @@ fn run() -> Result<(), Box<dyn Error>> {
         .ok_or(CliError::MissingDotfileDirectory)?;
     let plan = PackagePlan::load(Path::new(dot_dir), &package_name, &config.variables)?;
 
-    for entry in plan.entries {
-        println!(
-            "{}\t{}\t{}",
-            entry.source.display(),
-            entry.target.display(),
-            entry_kind_name(entry.kind)
+
+    if cli.dry_run {
+        for entry in &plan.entries {
+            println!(
+                "{}\t{}\t{}",
+                entry.source.display(),
+                entry.target.display(),
+                entry_kind_name(entry.kind)
+            );
+        }
+        return Ok(());
+    }
+
+    let report = plan.apply(&config.variables, cli.mode)?;
+    for skipped in report.skipped {
+        eprintln!(
+            "warning: skipped {} -> {}: {}",
+            skipped.entry.source.display(),
+            skipped.entry.target.display(),
+            skipped.reason
         );
     }
     Ok(())
@@ -55,17 +69,35 @@ struct Cli {
     config: Option<PathBuf>,
     dot_dir: Option<PathBuf>,
     package: Option<String>,
+    mode: ApplyMode,
+    dry_run: bool,
     help: bool,
 }
 
 impl Cli {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CliError> {
-        let mut cli = Self::default();
+        let mut cli = Self {
+            mode: ApplyMode::Normal,
+            ..Self::default()
+        };
         let mut args = args.into_iter();
 
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "--help" | "-h" => cli.help = true,
+                "--semi-force" => {
+                    if cli.mode != ApplyMode::Normal {
+                        return Err(CliError::ConflictingModes);
+                    }
+                    cli.mode = ApplyMode::SemiForce;
+                }
+                "--force" => {
+                    if cli.mode != ApplyMode::Normal {
+                        return Err(CliError::ConflictingModes);
+                    }
+                    cli.mode = ApplyMode::Force;
+                }
+                "--dry-run" => cli.dry_run = true,
                 "--config" => {
                     let path = args.next().ok_or(CliError::MissingConfigPath)?;
                     cli.config = Some(PathBuf::from(path));
@@ -94,6 +126,7 @@ impl Cli {
 enum CliError {
     MissingConfigPath,
     MissingDotDirectory,
+    ConflictingModes,
     MissingPackage,
     MissingDotfileDirectory,
     UnexpectedArgument(String),
@@ -106,6 +139,9 @@ impl std::fmt::Display for CliError {
             Self::MissingConfigPath => write!(formatter, "--config requires a file path\n{USAGE}"),
             Self::MissingDotDirectory => {
                 write!(formatter, "--dot-dir requires a directory path\n{USAGE}")
+            }
+            Self::ConflictingModes => {
+                write!(formatter, "only one force mode can be selected\n{USAGE}")
             }
             Self::MissingPackage => write!(formatter, "a package name is required\n{USAGE}"),
             Self::MissingDotfileDirectory => {
@@ -138,6 +174,8 @@ mod tests {
                 config: Some(PathBuf::from("/tmp/dtm.toml")),
                 dot_dir: None,
                 package: None,
+                mode: ApplyMode::Normal,
+                dry_run: false,
                 help: false,
             }
         );
@@ -189,6 +227,8 @@ mod tests {
                 config: Some(PathBuf::from("/tmp/config.yaml")),
                 dot_dir: Some(PathBuf::from("/tmp/dotfiles")),
                 package: Some("git".to_owned()),
+                mode: ApplyMode::Normal,
+                dry_run: false,
                 help: false,
             }
         );

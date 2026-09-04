@@ -29,7 +29,7 @@ To use another container engine or a different local image name:
 make test-inter CONTAINER_ENGINE=docker IMAGE=dtm-test-inter:debug
 ```
 
-Run the scanner for one package:
+Run and apply one package:
 
 ```sh
 dtm <PACKAGE>
@@ -37,7 +37,19 @@ dtm --dot-dir /path/to/dotfiles <PACKAGE>
 ```
 
 The command prints one tab-separated line per scanned file containing its source
-path, target path, and type (`symlink` or `template`).
+path, target path, and type (`symlink` or `template`), then applies the plan.
+Use `--dry-run` to only print the plan.
+
+Existing target files are handled as follows:
+
+```text
+(default)       warn and skip a different target
+--semi-force    replace a different symbolic link; keep a regular file
+--force         replace a different symbolic link or regular file
+```
+
+A template is rendered before the target is checked. A regular target whose
+bytes already match the rendered template is left unchanged.
 
 
 By default, `dtm` loads:

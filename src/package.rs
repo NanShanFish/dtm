@@ -13,7 +13,7 @@ pub struct PackagePlan {
     pub entries: Vec<PackageEntry>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageEntry {
     pub source: PathBuf,
     pub target: PathBuf,
@@ -24,6 +24,31 @@ pub struct PackageEntry {
 pub enum EntryKind {
     Symlink,
     Template,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyMode {
+    Normal,
+    SemiForce,
+    Force,
+}
+
+impl Default for ApplyMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ApplyReport {
+    pub applied: Vec<PackageEntry>,
+    pub skipped: Vec<SkippedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedEntry {
+    pub entry: PackageEntry,
+    pub reason: String,
 }
 
 impl PackagePlan {
@@ -43,6 +68,8 @@ impl PackagePlan {
         if !metadata.file_type().is_dir() {
             return Err(PackageError::NotDirectory { path: root });
         }
+        let root = fs::canonicalize(&root)
+            .map_err(|source| PackageError::ReadDirectory { path: root, source })?;
 
         let mut entries = Vec::new();
         let directories = fs::read_dir(&root).map_err(|source| PackageError::ReadDirectory {
@@ -103,6 +130,149 @@ impl PackagePlan {
             entries,
         })
     }
+
+    pub fn apply(
+        &self,
+        variables: &BTreeMap<String, String>,
+        mode: ApplyMode,
+    ) -> Result<ApplyReport, PackageError> {
+        let mut report = ApplyReport::default();
+
+        for entry in &self.entries {
+            match apply_entry(entry, variables, mode)? {
+                EntryAction::Applied => report.applied.push(entry.clone()),
+                EntryAction::Skipped(reason) => report.skipped.push(SkippedEntry {
+                    entry: entry.clone(),
+                    reason,
+                }),
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+#[derive(Debug)]
+enum EntryAction {
+    Applied,
+    Skipped(String),
+}
+
+fn apply_entry(
+    entry: &PackageEntry,
+    variables: &BTreeMap<String, String>,
+    mode: ApplyMode,
+) -> Result<EntryAction, PackageError> {
+    let rendered = match entry.kind {
+        EntryKind::Symlink => None,
+        EntryKind::Template => Some(render_template(&entry.source, variables)?),
+    };
+
+    let target_metadata = match fs::symlink_metadata(&entry.target) {
+        Ok(metadata) => Some(metadata),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(PackageError::ReadMetadata {
+                path: entry.target.clone(),
+                source,
+            });
+        }
+    };
+
+    if let Some(metadata) = target_metadata {
+        if metadata.file_type().is_dir() {
+            return Err(PackageError::TargetIsDirectory {
+                path: entry.target.clone(),
+            });
+        }
+
+        if target_is_current_entry(entry, rendered.as_deref())? {
+            return Ok(EntryAction::Applied);
+        }
+
+        let should_remove = match mode {
+            ApplyMode::Normal => false,
+            ApplyMode::SemiForce => metadata.file_type().is_symlink(),
+            ApplyMode::Force => true,
+        };
+
+        if !should_remove {
+            return Ok(EntryAction::Skipped("target already exists".to_owned()));
+        }
+
+        remove_target(&entry.target, metadata.file_type().is_symlink())?;
+    }
+
+    if let Some(parent) = entry.target.parent() {
+        fs::create_dir_all(parent).map_err(|source| PackageError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    match rendered {
+        Some(contents) => {
+            fs::write(&entry.target, contents).map_err(|source| PackageError::WriteFile {
+                path: entry.target.clone(),
+                source,
+            })?
+        }
+        None => create_symlink(&entry.source, &entry.target)?,
+    }
+
+    Ok(EntryAction::Applied)
+}
+
+fn target_is_current_entry(
+    entry: &PackageEntry,
+    rendered: Option<&str>,
+) -> Result<bool, PackageError> {
+    match entry.kind {
+        EntryKind::Symlink => {
+            if !entry.target.is_symlink() {
+                return Ok(false);
+            }
+            let target = fs::read_link(&entry.target).map_err(|source| PackageError::ReadLink {
+                path: entry.target.clone(),
+                source,
+            })?;
+            Ok(target == entry.source)
+        }
+        EntryKind::Template => {
+            let Some(rendered) = rendered else {
+                return Ok(false);
+            };
+            if entry.target.is_symlink() {
+                return Ok(false);
+            }
+            let existing = fs::read(&entry.target).map_err(|source| PackageError::ReadFile {
+                path: entry.target.clone(),
+                source,
+            })?;
+            Ok(existing == rendered.as_bytes())
+        }
+    }
+}
+
+fn remove_target(path: &Path, is_symlink: bool) -> Result<(), PackageError> {
+    let result = if is_symlink {
+        fs::remove_file(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|source| PackageError::RemoveTarget {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(unix)]
+fn create_symlink(source: &Path, target: &Path) -> Result<(), PackageError> {
+    std::os::unix::fs::symlink(source, target).map_err(|source_error| PackageError::CreateLink {
+        source: source.to_path_buf(),
+        target: target.to_path_buf(),
+        source_error,
+    })
 }
 
 fn validate_package_name(name: &str) -> Result<(), PackageError> {
@@ -209,10 +379,45 @@ fn ensure_unique_targets(entries: &[PackageEntry]) -> Result<(), PackageError> {
 }
 
 pub fn render_template(
-    _source: &Path,
-    _variables: &BTreeMap<String, String>,
-) -> Result<(), PackageError> {
-    Ok(())
+    source: &Path,
+    variables: &BTreeMap<String, String>,
+) -> Result<String, PackageError> {
+    let contents = fs::read_to_string(source).map_err(|source_error| PackageError::ReadFile {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    let mut rendered = String::with_capacity(contents.len());
+    let mut remaining = contents.as_str();
+
+    while let Some(start) = remaining.find("{=") {
+        rendered.push_str(&remaining[..start]);
+        let marker = &remaining[start + 2..];
+        let Some(end) = marker.find("=}") else {
+            rendered.push_str(&remaining[start..]);
+            remaining = "";
+            break;
+        };
+
+        let name = &marker[..end];
+        if name.is_empty() || name.contains(['\r', '\n']) {
+            rendered.push_str(&remaining[start..start + 2 + end + 2]);
+        } else {
+            let name = name.trim();
+            let value =
+                variables
+                    .get(name)
+                    .ok_or_else(|| PackageError::UnknownTemplateVariable {
+                        path: source.to_path_buf(),
+                        variable: name.to_owned(),
+                    })?;
+            rendered.push_str(value);
+        }
+        remaining = &marker[end + 2..];
+    }
+
+    rendered.push_str(remaining);
+
+    Ok(rendered)
 }
 
 #[derive(Debug)]
@@ -259,6 +464,39 @@ pub enum PackageError {
         second: PathBuf,
         target: PathBuf,
     },
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ReadLink {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CreateDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    WriteFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    RemoveTarget {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CreateLink {
+        source: PathBuf,
+        target: PathBuf,
+        source_error: std::io::Error,
+    },
+    TargetIsDirectory {
+        path: PathBuf,
+    },
+    UnknownTemplateVariable {
+        path: PathBuf,
+        variable: String,
+    },
+    UnsupportedPlatform,
 }
 
 impl fmt::Display for PackageError {
@@ -322,6 +560,65 @@ impl fmt::Display for PackageError {
                 second.display(),
                 target.display()
             ),
+            Self::ReadFile { path, source } => {
+                write!(
+                    formatter,
+                    "could not read file {}: {source}",
+                    path.display()
+                )
+            }
+            Self::ReadLink { path, source } => {
+                write!(
+                    formatter,
+                    "could not read link {}: {source}",
+                    path.display()
+                )
+            }
+            Self::CreateDirectory { path, source } => write!(
+                formatter,
+                "could not create directory {}: {source}",
+                path.display()
+            ),
+            Self::WriteFile { path, source } => {
+                write!(
+                    formatter,
+                    "could not write file {}: {source}",
+                    path.display()
+                )
+            }
+            Self::RemoveTarget { path, source } => {
+                write!(
+                    formatter,
+                    "could not remove target {}: {source}",
+                    path.display()
+                )
+            }
+            Self::CreateLink {
+                source,
+                target,
+                source_error,
+            } => write!(
+                formatter,
+                "could not link {} to {}: {source_error}",
+                source.display(),
+                target.display()
+            ),
+            Self::TargetIsDirectory { path } => write!(
+                formatter,
+                "target is a directory, refusing to replace it: {}",
+                path.display()
+            ),
+            Self::UnknownTemplateVariable { path, variable } => write!(
+                formatter,
+                "template {} references unknown variable '{variable}'",
+                path.display()
+            ),
+            Self::UnsupportedPlatform => {
+                write!(
+                    formatter,
+                    "symbolic links are not supported on this platform"
+                )
+            }
         }
     }
 }
@@ -329,7 +626,17 @@ impl fmt::Display for PackageError {
 impl Error for PackageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ReadDirectory { source, .. } | Self::ReadMetadata { source, .. } => Some(source),
+            Self::ReadDirectory { source, .. }
+            | Self::ReadMetadata { source, .. }
+            | Self::ReadFile { source, .. }
+            | Self::ReadLink { source, .. }
+            | Self::CreateDirectory { source, .. }
+            | Self::WriteFile { source, .. }
+            | Self::RemoveTarget { source, .. }
+            | Self::CreateLink {
+                source_error: source,
+                ..
+            } => Some(source),
             _ => None,
         }
     }
@@ -480,6 +787,159 @@ mod tests {
             PackagePlan::load(fixture.path(), "pkg", &variables).expect_err("target collision");
 
         assert!(matches!(error, PackageError::TargetCollision { .. }));
+    }
+
+    #[test]
+    fn applies_a_symlink_and_a_template() {
+        let fixture = TemporaryDirectory::new("apply");
+        let dot_dir = fixture.path().join("dotfiles");
+        let package = dot_dir.join("pkg/home");
+        let target_home = fixture.path().join("target");
+        fs::create_dir_all(&package).expect("create package");
+        fs::write(package.join("dot-config"), "linked\n").expect("write source");
+        fs::write(package.join("dot-settings.conf.tmpl"), "home={=home=}\n")
+            .expect("write template");
+
+        let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
+        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let report = plan
+            .apply(&variables, ApplyMode::Normal)
+            .expect("apply package");
+
+        assert_eq!(report.applied.len(), 2);
+        assert_eq!(
+            fs::read_link(target_home.join(".config")).unwrap(),
+            package.join("dot-config")
+        );
+        assert_eq!(
+            fs::read_to_string(target_home.join(".settings.conf")).expect("read template"),
+            format!("home={}\n", target_home.display())
+        );
+    }
+
+    #[test]
+    fn normal_mode_skips_different_targets_and_semi_force_replaces_only_links() {
+        let fixture = TemporaryDirectory::new("modes");
+        let dot_dir = fixture.path().join("dotfiles");
+        let package = dot_dir.join("pkg/home");
+        let target_home = fixture.path().join("target");
+        fs::create_dir_all(&package).expect("create package");
+        fs::write(package.join("dot-config"), "source\n").expect("write source");
+        fs::create_dir_all(&target_home).expect("create target");
+        fs::write(target_home.join(".config"), "existing\n").expect("write target");
+
+        let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
+        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let report = plan
+            .apply(&variables, ApplyMode::Normal)
+            .expect("normal apply");
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(
+            fs::read_to_string(target_home.join(".config")).unwrap(),
+            "existing\n"
+        );
+
+        let report = plan
+            .apply(&variables, ApplyMode::SemiForce)
+            .expect("semi-force apply");
+        assert_eq!(report.applied.len(), 0);
+        assert_eq!(report.skipped.len(), 1);
+
+        fs::remove_file(target_home.join(".config")).expect("remove ordinary target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(package.join("dot-config"), target_home.join(".config"))
+            .expect("create existing link");
+        let report = plan
+            .apply(&variables, ApplyMode::SemiForce)
+            .expect("semi-force link apply");
+        assert_eq!(report.applied.len(), 0);
+        assert_eq!(report.skipped[0].reason, "already up to date");
+        assert_eq!(
+            fs::read_link(target_home.join(".config")).unwrap(),
+            package.join("dot-config")
+        );
+    }
+
+    #[test]
+    fn force_replaces_an_existing_regular_file() {
+        let fixture = TemporaryDirectory::new("force");
+        let dot_dir = fixture.path().join("dotfiles");
+        let package = dot_dir.join("pkg/home");
+        let target_home = fixture.path().join("target");
+        fs::create_dir_all(&package).expect("create package");
+        fs::write(package.join("dot-config"), "source\n").expect("write source");
+        fs::create_dir_all(&target_home).expect("create target");
+        fs::write(target_home.join(".config"), "existing\n").expect("write target");
+
+        let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
+        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let report = plan
+            .apply(&variables, ApplyMode::Force)
+            .expect("force apply");
+
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            fs::read_link(target_home.join(".config")).unwrap(),
+            package.join("dot-config")
+        );
+    }
+
+    #[test]
+    fn template_compares_rendered_content_and_force_replaces_different_file() {
+        let fixture = TemporaryDirectory::new("template-conflict");
+        let dot_dir = fixture.path().join("dotfiles");
+        let package = dot_dir.join("pkg/home");
+        let target_home = fixture.path().join("target");
+        fs::create_dir_all(&package).expect("create package");
+        fs::write(package.join("settings.tmpl"), "name={=name=}\n").expect("write template");
+
+        let variables = BTreeMap::from([
+            ("home".to_owned(), target_home.display().to_string()),
+            ("name".to_owned(), "dtm".to_owned()),
+        ]);
+        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        plan.apply(&variables, ApplyMode::Normal)
+            .expect("first apply");
+
+        let report = plan
+            .apply(&variables, ApplyMode::Normal)
+            .expect("second apply");
+        assert_eq!(report.applied.len(), 0);
+        assert_eq!(report.skipped[0].reason, "already up to date");
+
+        fs::write(target_home.join("settings"), "changed\n").expect("change generated file");
+        let report = plan
+            .apply(&variables, ApplyMode::Normal)
+            .expect("normal apply");
+        assert_eq!(report.skipped[0].reason, "target already exists");
+
+        let report = plan
+            .apply(&variables, ApplyMode::Force)
+            .expect("force apply");
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(
+            fs::read_to_string(target_home.join("settings")).expect("read generated file"),
+            "name=dtm\n"
+        );
+    }
+
+    #[test]
+    fn template_rejects_unknown_variables_and_preserves_unclosed_or_multiline_markers() {
+        let fixture = TemporaryDirectory::new("template-rendering");
+        let source = fixture.path().join("source.tmpl");
+        fs::write(&source, "known={=known=} unclosed={=unknown\n").expect("write template");
+        let variables = BTreeMap::from([("known".to_owned(), "value".to_owned())]);
+        assert_eq!(
+            render_template(&source, &variables).expect("render template"),
+            "known=value unclosed={=unknown\n"
+        );
+
+        fs::write(&source, "missing={=missing=}").expect("write unknown template");
+        let error = render_template(&source, &variables).expect_err("unknown variable");
+        assert!(matches!(
+            error,
+            PackageError::UnknownTemplateVariable { variable, .. } if variable == "missing"
+        ));
     }
 
     struct TemporaryDirectory(PathBuf);
