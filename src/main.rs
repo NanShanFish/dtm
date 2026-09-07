@@ -5,7 +5,7 @@ use config::Config;
 use package::{ApplyMode, EntryKind, PackagePlan};
 use std::env;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const USAGE: &str = "Usage: dtm [--config <PATH>] [--dot-dir <PATH>] [--semi-force | --force] [--dry-run] <PACKAGE>";
 
@@ -26,12 +26,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let config = Config::load(cli.config.as_deref(), cli.dot_dir.as_deref())?;
     let package_name = cli.package.ok_or(CliError::MissingPackage)?;
-    let dot_dir = config
-        .variables
-        .get("_dotfile_dir")
-        .ok_or(CliError::MissingDotfileDirectory)?;
-    let plan = PackagePlan::load(Path::new(dot_dir), &package_name, &config.variables)?;
-
+    let plan = PackagePlan::load(&config.config.dotfile_dir, &package_name, &config.variables)?;
 
     if cli.dry_run {
         for entry in &plan.entries {
@@ -128,7 +123,6 @@ enum CliError {
     MissingDotDirectory,
     ConflictingModes,
     MissingPackage,
-    MissingDotfileDirectory,
     UnexpectedArgument(String),
     UnknownArgument(String),
 }
@@ -144,9 +138,6 @@ impl std::fmt::Display for CliError {
                 write!(formatter, "only one force mode can be selected\n{USAGE}")
             }
             Self::MissingPackage => write!(formatter, "a package name is required\n{USAGE}"),
-            Self::MissingDotfileDirectory => {
-                write!(formatter, "config variable '_dotfile_dir' is missing")
-            }
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected argument '{argument}'\n{USAGE}")
             }
@@ -165,13 +156,13 @@ mod tests {
 
     #[test]
     fn parses_config_path_as_a_separate_argument() {
-        let cli = Cli::parse(["--config".to_owned(), "/tmp/dtm.toml".to_owned()])
+        let cli = Cli::parse(["--config".to_owned(), "/tmp/dtm.yaml".to_owned()])
             .expect("valid arguments");
 
         assert_eq!(
             cli,
             Cli {
-                config: Some(PathBuf::from("/tmp/dtm.toml")),
+                config: Some(PathBuf::from("/tmp/dtm.yaml")),
                 dot_dir: None,
                 package: None,
                 mode: ApplyMode::Normal,
@@ -185,13 +176,6 @@ mod tests {
     fn parses_dot_directory_as_a_separate_argument() {
         let cli = Cli::parse(["--dot-dir".to_owned(), "/tmp/dotfiles".to_owned()])
             .expect("valid arguments");
-
-        assert_eq!(cli.dot_dir, Some(PathBuf::from("/tmp/dotfiles")));
-    }
-
-    #[test]
-    fn parses_dot_directory_with_equals() {
-        let cli = Cli::parse(["--dot-dir=/tmp/dotfiles".to_owned()]).expect("valid arguments");
 
         assert_eq!(cli.dot_dir, Some(PathBuf::from("/tmp/dotfiles")));
     }
@@ -216,7 +200,8 @@ mod tests {
         let cli = Cli::parse([
             "--config".to_owned(),
             "/tmp/config.yaml".to_owned(),
-            "--dot-dir=/tmp/dotfiles".to_owned(),
+            "--dot-dir".to_owned(),
+            "/tmp/dotfiles".to_owned(),
             "git".to_owned(),
         ])
         .expect("valid arguments");
@@ -239,13 +224,6 @@ mod tests {
         let cli = Cli::parse([]).expect("options are valid without a package");
 
         assert_eq!(cli.package, None);
-    }
-
-    #[test]
-    fn parses_config_path_with_equals() {
-        let cli = Cli::parse(["--config=/tmp/dtm.toml".to_owned()]).expect("valid arguments");
-
-        assert_eq!(cli.config, Some(PathBuf::from("/tmp/dtm.toml")));
     }
 
     #[test]

@@ -65,27 +65,28 @@ A different file can be selected with:
 dtm --config /path/to/config.yaml
 ```
 
-Configuration uses YAML. Variable values are plain scalars and support limited,
-non-shell interpolation:
+Configuration uses YAML with separate runtime configuration and template
+variables:
 
 ```yaml
+config:
+  dotfile_dir: /home/user/dotfiles
+
 variables:
   config_home: ${home}/.config
   local_bin: ${home}/.local/bin
   system_config: ${root}/etc/dtm
-  _dotfile_dir: ${home}/dotfiles
 ```
 
-`home` defaults to the current user's home directory. `root` defaults to the
-filesystem root (`/`). `_dotfile_dir` defaults to the current working directory.
-All three are normal variables and can be overridden in the configuration. The
-`--dot-dir` command-line option has the highest priority and overrides the
-`_dotfile_dir` value from the configuration:
+`config.dotfile_dir` must be an absolute path. It defaults to the current working
+directory when omitted. The `--dot-dir` option overrides it for the current run
+without changing the configuration file:
 
 ```sh
-dtm --dot-dir /path/to/dotfiles
+dtm --dot-dir /path/to/dotfiles <PACKAGE>
 ```
 
-A value may reference another declared variable, such as
-`${_dotfile_dir}/packages`. Unknown variables, malformed references, and
-reference cycles are rejected.
+`home` defaults to the current user's home directory and `root` defaults to the
+filesystem root (`/`). Both are normal variables and can be overridden. A value
+may reference another declared variable, such as `${config_home}/dtm`. Unknown
+variables, malformed references, and reference cycles are rejected.

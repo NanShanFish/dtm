@@ -187,7 +187,7 @@ fn apply_entry(
         }
 
         if target_is_current_entry(entry, rendered.as_deref())? {
-            return Ok(EntryAction::Applied);
+            return Ok(EntryAction::Skipped("already up to date".to_owned()));
         }
 
         let should_remove = match mode {

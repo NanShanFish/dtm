@@ -9,21 +9,30 @@ use std::path::{Path, PathBuf};
 const CONFIG_DIRECTORY: &str = "dtm";
 const CONFIG_FILE: &str = "config.yaml";
 const ROOT_DIRECTORY: &str = "/";
-const DOTFILE_DIRECTORY_VARIABLE: &str = "_dotfile_dir";
 
 #[derive(Debug)]
 pub struct Config {
+    pub config: RuntimeConfig,
     pub variables: BTreeMap<String, String>,
-    pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug)]
+pub struct RuntimeConfig {
+    pub dotfile_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
+    #[serde(default)]
+    config: RawRuntimeConfig,
+
     #[serde(default, alias = "variable")]
     variables: BTreeMap<String, String>,
+}
 
-    #[serde(flatten)]
-    extra: BTreeMap<String, serde_yaml::Value>,
+#[derive(Debug, Default, Deserialize)]
+struct RawRuntimeConfig {
+    dotfile_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -47,17 +56,21 @@ impl Config {
                 source,
             })?;
         let context = EvaluationContext::from_environment()?;
-        let variables =
-            resolve_variables(&raw.variables, &context, dot_dir_override).map_err(|source| {
-                ConfigError::Evaluate {
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })?;
+        let dotfile_dir = resolve_dotfile_dir(
+            raw.config.dotfile_dir.as_deref(),
+            &context,
+            dot_dir_override,
+        )?;
+        let variables = resolve_variables(&raw.variables, &context).map_err(|source| {
+            ConfigError::Evaluate {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
 
         Ok(Self {
+            config: RuntimeConfig { dotfile_dir },
             variables,
-            extra: raw.extra,
         })
     }
 }
@@ -86,7 +99,7 @@ fn home_directory() -> Result<PathBuf, ConfigError> {
 struct EvaluationContext {
     home: PathBuf,
     root: PathBuf,
-    dotfile_dir: PathBuf,
+    current_dir: PathBuf,
 }
 
 impl EvaluationContext {
@@ -94,19 +107,37 @@ impl EvaluationContext {
         Ok(Self {
             home: home_directory()?,
             root: PathBuf::from(ROOT_DIRECTORY),
-            dotfile_dir: env::current_dir().map_err(ConfigError::CurrentDirectory)?,
+            current_dir: env::current_dir().map_err(ConfigError::CurrentDirectory)?,
         })
+    }
+}
+
+fn resolve_dotfile_dir(
+    configured: Option<&Path>,
+    context: &EvaluationContext,
+    override_path: Option<&Path>,
+) -> Result<PathBuf, ConfigError> {
+    if let Some(path) = override_path {
+        return Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            context.current_dir.join(path)
+        });
+    }
+
+    match configured {
+        Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
+        Some(path) => Err(ConfigError::RelativeDotfileDirectory {
+            path: path.to_path_buf(),
+        }),
+        None => Ok(context.current_dir.clone()),
     }
 }
 
 fn resolve_variables(
     configured_variables: &BTreeMap<String, String>,
     context: &EvaluationContext,
-    dot_dir_override: Option<&Path>,
 ) -> Result<BTreeMap<String, String>, EvaluationError> {
-    let dotfile_dir = dot_dir_override
-        .map(PathBuf::from)
-        .unwrap_or_else(|| context.dotfile_dir.clone());
     let mut variables = BTreeMap::from([
         (
             "home".to_owned(),
@@ -116,18 +147,8 @@ fn resolve_variables(
             "root".to_owned(),
             context.root.to_string_lossy().into_owned(),
         ),
-        (
-            DOTFILE_DIRECTORY_VARIABLE.to_owned(),
-            dotfile_dir.to_string_lossy().into_owned(),
-        ),
     ]);
     variables.extend(configured_variables.clone());
-    if let Some(dot_dir_override) = dot_dir_override {
-        variables.insert(
-            DOTFILE_DIRECTORY_VARIABLE.to_owned(),
-            dot_dir_override.to_string_lossy().into_owned(),
-        );
-    }
 
     VariableResolver::new(&variables).resolve_all()
 }
@@ -261,6 +282,9 @@ fn validate_reference(variable: &str, reference: &str) -> Result<(), EvaluationE
 pub enum ConfigError {
     HomeNotFound,
     CurrentDirectory(std::io::Error),
+    RelativeDotfileDirectory {
+        path: PathBuf,
+    },
     Read {
         path: PathBuf,
         source: std::io::Error,
@@ -283,6 +307,13 @@ impl fmt::Display for ConfigError {
                 write!(
                     formatter,
                     "could not determine the current directory: {source}"
+                )
+            }
+            Self::RelativeDotfileDirectory { path } => {
+                write!(
+                    formatter,
+                    "config.dotfile_dir must be an absolute path: {}",
+                    path.display()
                 )
             }
             Self::Read { path, source } => {
@@ -315,6 +346,7 @@ impl Error for ConfigError {
         match self {
             Self::HomeNotFound => None,
             Self::CurrentDirectory(source) => Some(source),
+            Self::RelativeDotfileDirectory { .. } => None,
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::Evaluate { source, .. } => Some(source),
@@ -380,37 +412,44 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn context() -> EvaluationContext {
+        EvaluationContext {
+            home: PathBuf::from("/home/tester"),
+            root: PathBuf::from("/"),
+            current_dir: PathBuf::from("/work/dotfiles"),
+        }
+    }
+
     #[test]
     fn resolves_builtins_and_variable_references() {
         let raw: RawConfig = serde_yaml::from_str(
             r#"
+config:
+  dotfile_dir: /repos/dotfiles
 variables:
   config_home: ${home}/.config
   local_bin: ${home}/.local/bin
   dtm_config: ${config_home}/dtm
   system_config: ${root}/etc/dtm
-profile:
-  enabled: true
+unknown:
+  ignored: true
 "#,
         )
         .expect("valid config");
-        let context = EvaluationContext {
-            home: PathBuf::from("/home/tester"),
-            root: PathBuf::from("/"),
-            dotfile_dir: PathBuf::from("/work/dotfiles"),
-        };
 
-        let variables =
-            resolve_variables(&raw.variables, &context, None).expect("resolve variables");
+        let variables = resolve_variables(&raw.variables, &context()).expect("resolve variables");
 
+        assert_eq!(
+            raw.config.dotfile_dir,
+            Some(PathBuf::from("/repos/dotfiles"))
+        );
         assert_eq!(variables["home"], "/home/tester");
         assert_eq!(variables["root"], "/");
-        assert_eq!(variables["_dotfile_dir"], "/work/dotfiles");
+        assert!(!variables.contains_key("_dotfile_dir"));
         assert_eq!(variables["config_home"], "/home/tester/.config");
         assert_eq!(variables["local_bin"], "/home/tester/.local/bin");
         assert_eq!(variables["dtm_config"], "/home/tester/.config/dtm");
         assert_eq!(variables["system_config"], "/etc/dtm");
-        assert_eq!(raw.extra["profile"]["enabled"].as_bool(), Some(true));
     }
 
     #[test]
@@ -418,55 +457,61 @@ profile:
         let variables = BTreeMap::from([
             ("home".to_owned(), "/custom/home".to_owned()),
             ("root".to_owned(), "/custom/root".to_owned()),
-            ("_dotfile_dir".to_owned(), "/configured/dotfiles".to_owned()),
-            ("config".to_owned(), "${home}/.config".to_owned()),
+            ("config_home".to_owned(), "${home}/.config".to_owned()),
             ("system_config".to_owned(), "${root}/etc/dtm".to_owned()),
         ]);
-        let context = EvaluationContext {
-            home: PathBuf::from("/home/tester"),
-            root: PathBuf::from("/"),
-            dotfile_dir: PathBuf::from("/work/dotfiles"),
-        };
 
-        let resolved = resolve_variables(&variables, &context, None).expect("resolve variables");
+        let resolved = resolve_variables(&variables, &context()).expect("resolve variables");
 
         assert_eq!(resolved["home"], "/custom/home");
         assert_eq!(resolved["root"], "/custom/root");
-        assert_eq!(resolved["_dotfile_dir"], "/configured/dotfiles");
-        assert_eq!(resolved["config"], "/custom/home/.config");
+        assert_eq!(resolved["config_home"], "/custom/home/.config");
         assert_eq!(resolved["system_config"], "/custom/root/etc/dtm");
     }
 
     #[test]
-    fn command_line_dotfile_directory_overrides_configured_value() {
-        let variables =
-            BTreeMap::from([("_dotfile_dir".to_owned(), "/configured/dotfiles".to_owned())]);
-        let context = EvaluationContext {
-            home: PathBuf::from("/home/tester"),
-            root: PathBuf::from("/"),
-            dotfile_dir: PathBuf::from("/work/dotfiles"),
-        };
+    fn resolves_dotfile_directory_priority() {
+        let context = context();
 
-        let resolved = resolve_variables(&variables, &context, Some(Path::new("/cli/dotfiles")))
-            .expect("resolve variables");
+        assert_eq!(
+            resolve_dotfile_dir(Some(Path::new("/configured")), &context, None)
+                .expect("configured path"),
+            PathBuf::from("/configured")
+        );
+        assert_eq!(
+            resolve_dotfile_dir(
+                Some(Path::new("/configured")),
+                &context,
+                Some(Path::new("relative-cli")),
+            )
+            .expect("command-line path"),
+            PathBuf::from("/work/dotfiles/relative-cli")
+        );
+        assert_eq!(
+            resolve_dotfile_dir(None, &context, None).expect("current path"),
+            PathBuf::from("/work/dotfiles")
+        );
+    }
 
-        assert_eq!(resolved["_dotfile_dir"], "/cli/dotfiles");
+    #[test]
+    fn rejects_relative_configured_dotfile_directory() {
+        let error = resolve_dotfile_dir(Some(Path::new("relative")), &context(), None)
+            .expect_err("relative configured path");
+
+        assert!(matches!(
+            error,
+            ConfigError::RelativeDotfileDirectory { .. }
+        ));
     }
 
     #[test]
     fn rejects_unknown_references() {
-        let variables = BTreeMap::from([("config".to_owned(), "${MISSING}/dtm".to_owned())]);
-        let context = EvaluationContext {
-            home: PathBuf::from("/home/tester"),
-            root: PathBuf::from("/"),
-            dotfile_dir: PathBuf::from("/work/dotfiles"),
-        };
-
-        let error = resolve_variables(&variables, &context, None).expect_err("unknown reference");
+        let variables = BTreeMap::from([("config_home".to_owned(), "${missing}/dtm".to_owned())]);
+        let error = resolve_variables(&variables, &context()).expect_err("unknown reference");
 
         assert!(matches!(
             error,
-            EvaluationError::UnknownReference { reference, .. } if reference == "MISSING"
+            EvaluationError::UnknownReference { reference, .. } if reference == "missing"
         ));
     }
 
@@ -476,41 +521,53 @@ profile:
             ("a".to_owned(), "${b}".to_owned()),
             ("b".to_owned(), "${a}".to_owned()),
         ]);
-        let context = EvaluationContext {
-            home: PathBuf::from("/home/tester"),
-            root: PathBuf::from("/"),
-            dotfile_dir: PathBuf::from("/work/dotfiles"),
-        };
-
-        let error = resolve_variables(&variables, &context, None).expect_err("cycle");
+        let error = resolve_variables(&variables, &context()).expect_err("cycle");
 
         assert!(matches!(error, EvaluationError::Cycle { .. }));
     }
 
     #[test]
-    fn loads_an_explicit_yaml_file() {
-        let path = temporary_path("explicit");
-        fs::write(&path, "variables:\n  config_home: /tmp/config\n").expect("write fixture");
+    fn loads_configured_dotfile_directory() {
+        let path = temporary_path("configured-dot-dir");
+        fs::write(
+            &path,
+            "config:\n  dotfile_dir: /configured/dotfiles\nvariables:\n  config_home: /tmp/config\n",
+        )
+        .expect("write fixture");
 
         let config = Config::load(Some(&path), None).expect("load config");
 
+        assert_eq!(
+            config.config.dotfile_dir,
+            PathBuf::from("/configured/dotfiles")
+        );
         assert_eq!(config.variables["home"], fixture_home());
         assert_eq!(config.variables["root"], "/");
-        assert_eq!(config.variables["_dotfile_dir"], current_directory());
+        assert!(!config.variables.contains_key("_dotfile_dir"));
         assert_eq!(config.variables["config_home"], "/tmp/config");
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn loads_command_line_dotfile_directory_override() {
+    fn defaults_dotfile_directory_to_current_directory() {
+        let path = temporary_path("default-dot-dir");
+        fs::write(&path, "variables: {}\n").expect("write fixture");
+
+        let config = Config::load(Some(&path), None).expect("load config");
+
+        assert_eq!(config.config.dotfile_dir, env::current_dir().unwrap());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn command_line_dotfile_directory_overrides_config() {
         let path = temporary_path("dot-dir-override");
-        fs::write(&path, "variables:\n  _dotfile_dir: /configured/dotfiles\n")
-            .expect("write fixture");
+        fs::write(&path, "config:\n  dotfile_dir: /configured/dotfiles\n").expect("write fixture");
 
         let config =
             Config::load(Some(&path), Some(Path::new("/cli/dotfiles"))).expect("load config");
 
-        assert_eq!(config.variables["_dotfile_dir"], "/cli/dotfiles");
+        assert_eq!(config.config.dotfile_dir, PathBuf::from("/cli/dotfiles"));
         let _ = fs::remove_file(path);
     }
 
@@ -525,13 +582,6 @@ profile:
 
     fn fixture_home() -> String {
         env::var("HOME").expect("HOME is set for tests")
-    }
-
-    fn current_directory() -> String {
-        env::current_dir()
-            .expect("current directory is available")
-            .to_string_lossy()
-            .into_owned()
     }
 
     fn temporary_path(name: &str) -> PathBuf {

@@ -19,7 +19,7 @@ ENV HOME=/home/dtm \
     LOGNAME=dtm \
     PATH=/usr/local/bin:/usr/bin:/bin
 
-WORKDIR /home/dtm
+WORKDIR /home/dtm/dot/pkgs
 USER dtm
 
 CMD ["/bin/bash", "--login"]
