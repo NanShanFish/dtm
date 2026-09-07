@@ -1,13 +1,13 @@
 mod config;
 mod package;
 
-use config::Config;
+use config::{Config, configured_pkgs_dir, set_pkgs_dir};
 use package::{ApplyMode, EntryKind, PackagePlan};
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: dtm [--config <PATH>] [--dot-dir <PATH>] [--semi-force | --force] [--dry-run] <PACKAGE>";
+const USAGE: &str = "Usage:\n  dtm [--config <PATH>] [--pkgs-dir <PATH>] [--semi-force | --force] [--dry-run] <PACKAGE>\n  dtm [--config <PATH>] config set pkgs_dir <PATH>\n  dtm [--config <PATH>] config get pkgs_dir\n  dtm [--config <PATH>] config list";
 
 fn main() {
     if let Err(error) = run() {
@@ -24,11 +24,38 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let config = Config::load(cli.config.as_deref(), cli.dot_dir.as_deref())?;
-    let package_name = cli.package.ok_or(CliError::MissingPackage)?;
-    let plan = PackagePlan::load(&config.config.dotfile_dir, &package_name, &config.variables)?;
+    match cli.command.ok_or(CliError::MissingCommand)? {
+        Command::Config(ConfigCommand::SetPkgsDir(path)) => {
+            let (config_path, pkgs_dir) = set_pkgs_dir(cli.config.as_deref(), &path)?;
+            println!(
+                "set config.pkgs_dir to {} in {}",
+                pkgs_dir.display(),
+                config_path.display()
+            );
+        }
+        Command::Config(ConfigCommand::GetPkgsDir) => {
+            let config = Config::load(cli.config.as_deref(), None)?;
+            println!("{}", config.config.pkgs_dir.display());
+        }
+        Command::Config(ConfigCommand::List) => {
+            if let Some(pkgs_dir) = configured_pkgs_dir(cli.config.as_deref())? {
+                println!("pkgs_dir\t{}", pkgs_dir.display());
+            }
+        }
+        Command::Package(package) => run_package(cli.config.as_deref(), package)?,
+    }
 
-    if cli.dry_run {
+    Ok(())
+}
+
+fn run_package(
+    config_path: Option<&std::path::Path>,
+    package: PackageCommand,
+) -> Result<(), Box<dyn Error>> {
+    let config = Config::load(config_path, package.pkgs_dir.as_deref())?;
+    let plan = PackagePlan::load(&config.config.pkgs_dir, &package.name, &config.variables)?;
+
+    if package.dry_run {
         for entry in &plan.entries {
             println!(
                 "{}\t{}\t{}",
@@ -40,7 +67,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let report = plan.apply(&config.variables, cli.mode)?;
+    let report = plan.apply(&config.variables, package.mode)?;
     for skipped in report.skipped {
         eprintln!(
             "warning: skipped {} -> {}: {}",
@@ -62,67 +89,128 @@ fn entry_kind_name(kind: EntryKind) -> &'static str {
 #[derive(Debug, Default, PartialEq)]
 struct Cli {
     config: Option<PathBuf>,
-    dot_dir: Option<PathBuf>,
-    package: Option<String>,
+    command: Option<Command>,
+    help: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum Command {
+    Package(PackageCommand),
+    Config(ConfigCommand),
+}
+
+#[derive(Debug, PartialEq)]
+struct PackageCommand {
+    name: String,
+    pkgs_dir: Option<PathBuf>,
     mode: ApplyMode,
     dry_run: bool,
-    help: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum ConfigCommand {
+    SetPkgsDir(PathBuf),
+    GetPkgsDir,
+    List,
 }
 
 impl Cli {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, CliError> {
-        let mut cli = Self {
-            mode: ApplyMode::Normal,
-            ..Self::default()
-        };
+        let mut config = None;
+        let mut help = false;
+        let mut command_args = Vec::new();
         let mut args = args.into_iter();
 
         while let Some(argument) = args.next() {
             match argument.as_str() {
-                "--help" | "-h" => cli.help = true,
-                "--semi-force" => {
-                    if cli.mode != ApplyMode::Normal {
-                        return Err(CliError::ConflictingModes);
-                    }
-                    cli.mode = ApplyMode::SemiForce;
-                }
-                "--force" => {
-                    if cli.mode != ApplyMode::Normal {
-                        return Err(CliError::ConflictingModes);
-                    }
-                    cli.mode = ApplyMode::Force;
-                }
-                "--dry-run" => cli.dry_run = true,
                 "--config" => {
                     let path = args.next().ok_or(CliError::MissingConfigPath)?;
-                    cli.config = Some(PathBuf::from(path));
+                    config = Some(PathBuf::from(path));
                 }
-                "--dot-dir" => {
-                    let path = args.next().ok_or(CliError::MissingDotDirectory)?;
-                    cli.dot_dir = Some(PathBuf::from(path));
-                }
-                _ if argument.starts_with('-') => {
-                    return Err(CliError::UnknownArgument(argument));
-                }
-                _ => {
-                    if cli.package.is_some() {
-                        return Err(CliError::UnexpectedArgument(argument));
-                    }
-                    cli.package = Some(argument);
-                }
+                "--help" | "-h" => help = true,
+                _ => command_args.push(argument),
             }
         }
 
-        Ok(cli)
+        let command = if command_args.first().map(String::as_str) == Some("config") {
+            Some(Command::Config(parse_config_command(&command_args[1..])?))
+        } else if command_args.is_empty() {
+            None
+        } else {
+            Some(Command::Package(parse_package_command(command_args)?))
+        };
+
+        Ok(Self {
+            config,
+            command,
+            help,
+        })
     }
+}
+
+fn parse_config_command(args: &[String]) -> Result<ConfigCommand, CliError> {
+    match args {
+        [action] if action == "list" => Ok(ConfigCommand::List),
+        [action, key] if action == "get" && key == "pkgs_dir" => Ok(ConfigCommand::GetPkgsDir),
+        [action, key, value] if action == "set" && key == "pkgs_dir" => {
+            Ok(ConfigCommand::SetPkgsDir(PathBuf::from(value)))
+        }
+        _ => Err(CliError::InvalidConfigCommand),
+    }
+}
+
+fn parse_package_command(args: Vec<String>) -> Result<PackageCommand, CliError> {
+    let mut name = None;
+    let mut pkgs_dir = None;
+    let mut mode = ApplyMode::Normal;
+    let mut dry_run = false;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--semi-force" => {
+                if mode != ApplyMode::Normal {
+                    return Err(CliError::ConflictingModes);
+                }
+                mode = ApplyMode::SemiForce;
+            }
+            "--force" => {
+                if mode != ApplyMode::Normal {
+                    return Err(CliError::ConflictingModes);
+                }
+                mode = ApplyMode::Force;
+            }
+            "--dry-run" => dry_run = true,
+            "--pkgs-dir" => {
+                let path = args.next().ok_or(CliError::MissingPkgsDirectory)?;
+                pkgs_dir = Some(PathBuf::from(path));
+            }
+            _ if argument.starts_with('-') => return Err(CliError::UnknownArgument(argument)),
+            _ => {
+                if name.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument));
+                }
+                name = Some(argument);
+            }
+        }
+    }
+
+    Ok(PackageCommand {
+        name: name.ok_or(CliError::MissingPackage)?,
+        pkgs_dir,
+        mode,
+        dry_run,
+    })
 }
 
 #[derive(Debug, PartialEq)]
 enum CliError {
     MissingConfigPath,
-    MissingDotDirectory,
+    MissingPkgsDirectory,
     ConflictingModes,
+    MissingCommand,
     MissingPackage,
+    InvalidConfigCommand,
     UnexpectedArgument(String),
     UnknownArgument(String),
 }
@@ -131,13 +219,15 @@ impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingConfigPath => write!(formatter, "--config requires a file path\n{USAGE}"),
-            Self::MissingDotDirectory => {
-                write!(formatter, "--dot-dir requires a directory path\n{USAGE}")
+            Self::MissingPkgsDirectory => {
+                write!(formatter, "--pkgs-dir requires a directory path\n{USAGE}")
             }
             Self::ConflictingModes => {
                 write!(formatter, "only one force mode can be selected\n{USAGE}")
             }
+            Self::MissingCommand => write!(formatter, "a command or package is required\n{USAGE}"),
             Self::MissingPackage => write!(formatter, "a package name is required\n{USAGE}"),
+            Self::InvalidConfigCommand => write!(formatter, "invalid config command\n{USAGE}"),
             Self::UnexpectedArgument(argument) => {
                 write!(formatter, "unexpected argument '{argument}'\n{USAGE}")
             }
@@ -154,83 +244,103 @@ impl Error for CliError {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_config_path_as_a_separate_argument() {
-        let cli = Cli::parse(["--config".to_owned(), "/tmp/dtm.yaml".to_owned()])
-            .expect("valid arguments");
-
-        assert_eq!(
-            cli,
-            Cli {
-                config: Some(PathBuf::from("/tmp/dtm.yaml")),
-                dot_dir: None,
-                package: None,
-                mode: ApplyMode::Normal,
-                dry_run: false,
-                help: false,
-            }
-        );
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|argument| (*argument).to_owned()).collect()
     }
 
     #[test]
-    fn parses_dot_directory_as_a_separate_argument() {
-        let cli = Cli::parse(["--dot-dir".to_owned(), "/tmp/dotfiles".to_owned()])
-            .expect("valid arguments");
-
-        assert_eq!(cli.dot_dir, Some(PathBuf::from("/tmp/dotfiles")));
-    }
-
-    #[test]
-    fn rejects_missing_dot_directory() {
-        assert_eq!(
-            Cli::parse(["--dot-dir".to_owned()]),
-            Err(CliError::MissingDotDirectory)
-        );
-    }
-
-    #[test]
-    fn parses_package_name() {
-        let cli = Cli::parse(["git".to_owned()]).expect("valid arguments");
-
-        assert_eq!(cli.package, Some("git".to_owned()));
-    }
-
-    #[test]
-    fn parses_package_with_options() {
-        let cli = Cli::parse([
-            "--config".to_owned(),
-            "/tmp/config.yaml".to_owned(),
-            "--dot-dir".to_owned(),
-            "/tmp/dotfiles".to_owned(),
-            "git".to_owned(),
-        ])
+    fn parses_package_with_shared_and_package_options() {
+        let cli = Cli::parse(strings(&[
+            "--config",
+            "/tmp/config.yaml",
+            "--pkgs-dir",
+            "/tmp/dotfiles",
+            "--dry-run",
+            "git",
+        ]))
         .expect("valid arguments");
 
         assert_eq!(
             cli,
             Cli {
                 config: Some(PathBuf::from("/tmp/config.yaml")),
-                dot_dir: Some(PathBuf::from("/tmp/dotfiles")),
-                package: Some("git".to_owned()),
-                mode: ApplyMode::Normal,
-                dry_run: false,
+                command: Some(Command::Package(PackageCommand {
+                    name: "git".to_owned(),
+                    pkgs_dir: Some(PathBuf::from("/tmp/dotfiles")),
+                    mode: ApplyMode::Normal,
+                    dry_run: true,
+                })),
                 help: false,
             }
         );
     }
 
     #[test]
-    fn rejects_missing_package() {
-        let cli = Cli::parse([]).expect("options are valid without a package");
+    fn parses_config_set_with_shared_config_option() {
+        let cli = Cli::parse(strings(&[
+            "--config",
+            "/tmp/config.yaml",
+            "config",
+            "set",
+            "pkgs_dir",
+            "./dotfiles",
+        ]))
+        .expect("valid arguments");
 
-        assert_eq!(cli.package, None);
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.yaml")));
+        assert_eq!(
+            cli.command,
+            Some(Command::Config(ConfigCommand::SetPkgsDir(PathBuf::from(
+                "./dotfiles"
+            ))))
+        );
     }
 
     #[test]
-    fn rejects_missing_config_path() {
+    fn parses_config_get() {
+        let cli = Cli::parse(strings(&["config", "get", "pkgs_dir"])).expect("valid arguments");
+
         assert_eq!(
-            Cli::parse(["--config".to_owned()]),
+            cli.command,
+            Some(Command::Config(ConfigCommand::GetPkgsDir))
+        );
+    }
+
+    #[test]
+    fn parses_config_list() {
+        let cli = Cli::parse(strings(&["config", "list"])).expect("valid arguments");
+
+        assert_eq!(cli.command, Some(Command::Config(ConfigCommand::List)));
+    }
+
+    #[test]
+    fn config_command_rejects_package_only_options() {
+        assert_eq!(
+            Cli::parse(strings(&["config", "get", "pkgs_dir", "--force"])),
+            Err(CliError::InvalidConfigCommand)
+        );
+        assert_eq!(
+            Cli::parse(strings(&[
+                "config",
+                "get",
+                "pkgs_dir",
+                "--pkgs-dir",
+                "/tmp"
+            ])),
+            Err(CliError::InvalidConfigCommand)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_option_values_and_package() {
+        assert_eq!(
+            Cli::parse(strings(&["--config"])),
             Err(CliError::MissingConfigPath)
         );
+        assert_eq!(
+            Cli::parse(strings(&["--pkgs-dir"])),
+            Err(CliError::MissingPkgsDirectory)
+        );
+        assert_eq!(Cli::parse(Vec::new()).unwrap().command, None);
     }
 }

@@ -53,13 +53,13 @@ pub struct SkippedEntry {
 
 impl PackagePlan {
     pub fn load(
-        dot_dir: &Path,
+        pkgs_dir: &Path,
         package_name: &str,
         variables: &BTreeMap<String, String>,
     ) -> Result<Self, PackageError> {
         validate_package_name(package_name)?;
 
-        let root = dot_dir.join(package_name);
+        let root = pkgs_dir.join(package_name);
         let metadata =
             fs::symlink_metadata(&root).map_err(|source| PackageError::ReadDirectory {
                 path: root.clone(),
@@ -650,8 +650,8 @@ mod tests {
     #[test]
     fn reads_regular_and_template_files_from_a_package() {
         let fixture = TemporaryDirectory::new("package-files");
-        let dot_dir = fixture.path();
-        let package = dot_dir.join("tmux");
+        let pkgs_dir = fixture.path();
+        let package = pkgs_dir.join("tmux");
         fs::create_dir_all(package.join(".dtm/hooks")).expect("create metadata");
         fs::create_dir_all(package.join("config_home/tmux")).expect("create package files");
         fs::write(package.join(".dtm/config.yaml"), "hooks: {}\n").expect("write metadata");
@@ -664,7 +664,7 @@ mod tests {
 
         let variables =
             BTreeMap::from([("config_home".to_owned(), "/home/tester/.config".to_owned())]);
-        let plan = PackagePlan::load(dot_dir, "tmux", &variables).expect("load package");
+        let plan = PackagePlan::load(pkgs_dir, "tmux", &variables).expect("load package");
 
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(
@@ -680,13 +680,13 @@ mod tests {
     #[test]
     fn maps_dot_prefixed_files_to_hidden_targets() {
         let fixture = TemporaryDirectory::new("hidden-file");
-        let dot_dir = fixture.path();
-        let package = dot_dir.join("git");
+        let pkgs_dir = fixture.path();
+        let package = pkgs_dir.join("git");
         fs::create_dir_all(package.join("home")).expect("create package files");
         fs::write(package.join("home/dot-gitconfig"), "[user]\n").expect("write file");
 
         let variables = BTreeMap::from([("home".to_owned(), "/home/tester".to_owned())]);
-        let plan = PackagePlan::load(dot_dir, "git", &variables).expect("load package");
+        let plan = PackagePlan::load(pkgs_dir, "git", &variables).expect("load package");
 
         assert_eq!(
             plan.entries,
@@ -701,8 +701,8 @@ mod tests {
     #[test]
     fn reads_template_files_and_removes_the_template_marker() {
         let fixture = TemporaryDirectory::new("template-file");
-        let dot_dir = fixture.path();
-        let package = dot_dir.join("tmux");
+        let pkgs_dir = fixture.path();
+        let package = pkgs_dir.join("tmux");
         fs::create_dir_all(package.join("config_home/tmux")).expect("create package files");
         fs::write(
             package.join("config_home/tmux/tmux.tmpl.conf"),
@@ -712,7 +712,7 @@ mod tests {
 
         let variables =
             BTreeMap::from([("config_home".to_owned(), "/home/tester/.config".to_owned())]);
-        let plan = PackagePlan::load(dot_dir, "tmux", &variables).expect("load package");
+        let plan = PackagePlan::load(pkgs_dir, "tmux", &variables).expect("load package");
 
         assert_eq!(
             plan.entries,
@@ -792,8 +792,8 @@ mod tests {
     #[test]
     fn applies_a_symlink_and_a_template() {
         let fixture = TemporaryDirectory::new("apply");
-        let dot_dir = fixture.path().join("dotfiles");
-        let package = dot_dir.join("pkg/home");
+        let pkgs_dir = fixture.path().join("dotfiles");
+        let package = pkgs_dir.join("pkg/home");
         let target_home = fixture.path().join("target");
         fs::create_dir_all(&package).expect("create package");
         fs::write(package.join("dot-config"), "linked\n").expect("write source");
@@ -801,7 +801,7 @@ mod tests {
             .expect("write template");
 
         let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
-        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
         let report = plan
             .apply(&variables, ApplyMode::Normal)
             .expect("apply package");
@@ -820,8 +820,8 @@ mod tests {
     #[test]
     fn normal_mode_skips_different_targets_and_semi_force_replaces_only_links() {
         let fixture = TemporaryDirectory::new("modes");
-        let dot_dir = fixture.path().join("dotfiles");
-        let package = dot_dir.join("pkg/home");
+        let pkgs_dir = fixture.path().join("dotfiles");
+        let package = pkgs_dir.join("pkg/home");
         let target_home = fixture.path().join("target");
         fs::create_dir_all(&package).expect("create package");
         fs::write(package.join("dot-config"), "source\n").expect("write source");
@@ -829,7 +829,7 @@ mod tests {
         fs::write(target_home.join(".config"), "existing\n").expect("write target");
 
         let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
-        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
         let report = plan
             .apply(&variables, ApplyMode::Normal)
             .expect("normal apply");
@@ -863,8 +863,8 @@ mod tests {
     #[test]
     fn force_replaces_an_existing_regular_file() {
         let fixture = TemporaryDirectory::new("force");
-        let dot_dir = fixture.path().join("dotfiles");
-        let package = dot_dir.join("pkg/home");
+        let pkgs_dir = fixture.path().join("dotfiles");
+        let package = pkgs_dir.join("pkg/home");
         let target_home = fixture.path().join("target");
         fs::create_dir_all(&package).expect("create package");
         fs::write(package.join("dot-config"), "source\n").expect("write source");
@@ -872,7 +872,7 @@ mod tests {
         fs::write(target_home.join(".config"), "existing\n").expect("write target");
 
         let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
-        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
         let report = plan
             .apply(&variables, ApplyMode::Force)
             .expect("force apply");
@@ -887,8 +887,8 @@ mod tests {
     #[test]
     fn template_compares_rendered_content_and_force_replaces_different_file() {
         let fixture = TemporaryDirectory::new("template-conflict");
-        let dot_dir = fixture.path().join("dotfiles");
-        let package = dot_dir.join("pkg/home");
+        let pkgs_dir = fixture.path().join("dotfiles");
+        let package = pkgs_dir.join("pkg/home");
         let target_home = fixture.path().join("target");
         fs::create_dir_all(&package).expect("create package");
         fs::write(package.join("settings.tmpl"), "name={=name=}\n").expect("write template");
@@ -897,7 +897,7 @@ mod tests {
             ("home".to_owned(), target_home.display().to_string()),
             ("name".to_owned(), "dtm".to_owned()),
         ]);
-        let plan = PackagePlan::load(&dot_dir, "pkg", &variables).expect("load package");
+        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
         plan.apply(&variables, ApplyMode::Normal)
             .expect("first apply");
 

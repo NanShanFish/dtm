@@ -33,7 +33,7 @@ Run and apply one package:
 
 ```sh
 dtm <PACKAGE>
-dtm --dot-dir /path/to/dotfiles <PACKAGE>
+dtm --pkgs-dir /path/to/dotfiles <PACKAGE>
 ```
 
 The command prints one tab-separated line per scanned file containing its source
@@ -59,18 +59,36 @@ $XDG_CONFIG_HOME/dtm/config.yaml
 ```
 
 When `XDG_CONFIG_HOME` is not set, it uses `~/.config/dtm/config.yaml`.
-A different file can be selected with:
+Use the shared `--config` option before either a package or config command to
+select a different file:
 
 ```sh
-dtm --config /path/to/config.yaml
+dtm --config /path/to/config.yaml <PACKAGE>
+dtm --config /path/to/config.yaml config get pkgs_dir
 ```
+
+Persist or inspect the packages directory with:
+
+```sh
+dtm config set pkgs_dir /path/to/dotfiles
+dtm config get pkgs_dir
+dtm config list
+```
+
+`config list` prints only keys explicitly present in the configuration file,
+using tab-separated columns. It currently lists `pkgs_dir` when configured.
+
+`config set pkgs_dir` accepts a relative input path, resolves it to an existing
+absolute directory, and writes that path to `config.pkgs_dir`. Package-only
+options such as `--pkgs-dir`, `--dry-run`, and force modes are not accepted by
+config commands.
 
 Configuration uses YAML with separate runtime configuration and template
 variables:
 
 ```yaml
 config:
-  dotfile_dir: /home/user/dotfiles
+  pkgs_dir: /home/user/dotfiles
 
 variables:
   config_home: ${home}/.config
@@ -78,12 +96,12 @@ variables:
   system_config: ${root}/etc/dtm
 ```
 
-`config.dotfile_dir` must be an absolute path. It defaults to the current working
-directory when omitted. The `--dot-dir` option overrides it for the current run
+`config.pkgs_dir` must be an absolute path. It defaults to the current working
+directory when omitted. The `--pkgs-dir` option overrides it for the current run
 without changing the configuration file:
 
 ```sh
-dtm --dot-dir /path/to/dotfiles <PACKAGE>
+dtm --pkgs-dir /path/to/dotfiles <PACKAGE>
 ```
 
 `home` defaults to the current user's home directory and `root` defaults to the
