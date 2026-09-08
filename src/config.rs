@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -20,9 +20,10 @@ pub struct Config {
 #[derive(Debug)]
 pub struct RuntimeConfig {
     pub pkgs_dir: PathBuf,
+    pub backup_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     config: RawRuntimeConfig,
@@ -31,10 +32,10 @@ struct RawConfig {
     variables: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawRuntimeConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pkgs_dir: Option<PathBuf>,
+    backup_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -63,6 +64,7 @@ impl Config {
         let context = EvaluationContext::from_environment()?;
         let pkgs_dir =
             resolve_pkgs_dir(raw.config.pkgs_dir.as_deref(), &context, pkgs_dir_override)?;
+        let backup_dir = resolve_backup_dir(raw.config.backup_dir.as_deref())?;
         let variables = resolve_variables(&raw.variables, &context).map_err(|source| {
             ConfigError::Evaluate {
                 path: path.to_path_buf(),
@@ -71,27 +73,43 @@ impl Config {
         })?;
 
         Ok(Self {
-            config: RuntimeConfig { pkgs_dir },
+            config: RuntimeConfig {
+                pkgs_dir,
+                backup_dir,
+            },
             variables,
         })
     }
 }
 
-pub fn configured_pkgs_dir(path: Option<&Path>) -> Result<Option<PathBuf>, ConfigError> {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfiguredRuntimeConfig {
+    pub pkgs_dir: Option<PathBuf>,
+    pub backup_dir: Option<PathBuf>,
+}
+
+pub fn configured_runtime_config(
+    path: Option<&Path>,
+) -> Result<ConfiguredRuntimeConfig, ConfigError> {
     let path = match path {
         Some(path) => path.to_path_buf(),
         None => default_config_path()?,
     };
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConfiguredRuntimeConfig::default());
+        }
         Err(source) => {
             return Err(ConfigError::Read { path, source });
         }
     };
     let raw: RawConfig =
         serde_yaml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })?;
-    Ok(raw.config.pkgs_dir)
+    Ok(ConfiguredRuntimeConfig {
+        pkgs_dir: raw.config.pkgs_dir,
+        backup_dir: raw.config.backup_dir,
+    })
 }
 
 pub fn set_pkgs_dir(
@@ -111,33 +129,67 @@ pub fn set_pkgs_dir(
         return Err(ConfigError::PkgsDirectoryNotDirectory { path: pkgs_dir });
     }
 
-    let original = match fs::read_to_string(&path) {
-        Ok(contents) => {
-            serde_yaml::from_str::<RawConfig>(&contents).map_err(|source| ConfigError::Parse {
-                path: path.clone(),
-                source,
-            })?;
-            contents
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(ConfigError::Read {
-                path: path.clone(),
-                source,
-            });
-        }
-    };
-    let contents = update_pkgs_dir_yaml(&original, &pkgs_dir);
+    let original = read_config_for_update(&path)?;
+    let contents = update_runtime_path_yaml(&original, "pkgs_dir", &pkgs_dir);
     write_config_atomically(&path, contents.as_bytes())?;
 
     Ok((path, pkgs_dir))
 }
 
-fn update_pkgs_dir_yaml(original: &str, pkgs_dir: &Path) -> String {
-    let value = yaml_scalar(&pkgs_dir.to_string_lossy());
-    let mut lines: Vec<&str> = original.split_inclusive('\n').collect();
+pub fn set_backup_dir(
+    path: Option<&Path>,
+    backup_dir: &Path,
+) -> Result<(PathBuf, PathBuf), ConfigError> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => default_config_path()?,
+    };
+    let backup_dir = if backup_dir.is_absolute() {
+        backup_dir.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(ConfigError::CurrentDirectory)?
+            .join(backup_dir)
+    };
+    fs::create_dir_all(&backup_dir).map_err(|source| ConfigError::CreateBackupDirectory {
+        path: backup_dir.clone(),
+        source,
+    })?;
+    let backup_dir =
+        fs::canonicalize(&backup_dir).map_err(|source| ConfigError::ResolveBackupDirectory {
+            path: backup_dir,
+            source,
+        })?;
+
+    let original = read_config_for_update(&path)?;
+    let contents = update_runtime_path_yaml(&original, "backup_dir", &backup_dir);
+    write_config_atomically(&path, contents.as_bytes())?;
+
+    Ok((path, backup_dir))
+}
+
+fn read_config_for_update(path: &Path) -> Result<String, ConfigError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            serde_yaml::from_str::<RawConfig>(&contents).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(contents)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn update_runtime_path_yaml(original: &str, key: &str, path: &Path) -> String {
+    let value = yaml_scalar(&path.to_string_lossy());
+    let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_owned).collect();
     if original.is_empty() {
-        return format!("config:\n  pkgs_dir: {value}\n");
+        return format!("config:\n  {key}: {value}\n");
     }
 
     let config_index = lines
@@ -152,20 +204,17 @@ fn update_pkgs_dir_yaml(original: &str, pkgs_dir: &Path) -> String {
             .map(|(index, _)| index)
             .unwrap_or(lines.len());
 
-        if let Some(pkgs_index) =
-            (config_index + 1..section_end).find(|&index| is_config_key(lines[index], "pkgs_dir"))
+        if let Some(key_index) =
+            (config_index + 1..section_end).find(|&index| is_config_key(&lines[index], key))
         {
-            lines[pkgs_index] = replace_yaml_value(lines[pkgs_index], &value);
+            lines[key_index] = replace_yaml_value(&lines[key_index], &value);
         } else {
             let insert_at = (config_index + 1..section_end)
                 .rev()
                 .find(|&index| !lines[index].trim().is_empty())
                 .map(|index| index + 1)
                 .unwrap_or(config_index + 1);
-            lines.insert(
-                insert_at,
-                Box::leak(format!("  pkgs_dir: {value}\n").into_boxed_str()),
-            );
+            lines.insert(insert_at, format!("  {key}: {value}\n"));
         }
         return lines.concat();
     }
@@ -174,7 +223,7 @@ fn update_pkgs_dir_yaml(original: &str, pkgs_dir: &Path) -> String {
     if !result.ends_with('\n') {
         result.push('\n');
     }
-    result.push_str(&format!("config:\n  pkgs_dir: {value}\n"));
+    result.push_str(&format!("config:\n  {key}: {value}\n"));
     result
 }
 
@@ -207,7 +256,7 @@ fn is_config_key(line: &str, key: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with(':'))
 }
 
-fn replace_yaml_value(line: &str, value: &str) -> &'static str {
+fn replace_yaml_value(line: &str, value: &str) -> String {
     let newline = if line.ends_with("\r\n") {
         "\r\n"
     } else if line.ends_with('\n') {
@@ -219,7 +268,7 @@ fn replace_yaml_value(line: &str, value: &str) -> &'static str {
     let colon = body.find(':').expect("a config key contains a colon");
     let prefix = &body[..=colon];
     let comment = body.find(" #").map(|index| &body[index..]).unwrap_or("");
-    Box::leak(format!("{prefix} {value}{comment}{newline}").into_boxed_str())
+    format!("{prefix} {value}{comment}{newline}")
 }
 
 fn write_config_atomically(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
@@ -318,6 +367,16 @@ fn resolve_pkgs_dir(
             path: path.to_path_buf(),
         }),
         None => Ok(context.current_dir.clone()),
+    }
+}
+
+fn resolve_backup_dir(configured: Option<&Path>) -> Result<Option<PathBuf>, ConfigError> {
+    match configured {
+        Some(path) if path.is_absolute() => Ok(Some(path.to_path_buf())),
+        Some(path) => Err(ConfigError::RelativeBackupDirectory {
+            path: path.to_path_buf(),
+        }),
+        None => Ok(None),
     }
 }
 
@@ -472,6 +531,17 @@ pub enum ConfigError {
     RelativePkgsDirectory {
         path: PathBuf,
     },
+    RelativeBackupDirectory {
+        path: PathBuf,
+    },
+    ResolveBackupDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    CreateBackupDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     ResolvePkgsDirectory {
         path: PathBuf,
         source: std::io::Error,
@@ -483,7 +553,6 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    Serialize(serde_yaml::Error),
     WriteConfig {
         path: PathBuf,
         source: std::io::Error,
@@ -523,6 +592,21 @@ impl fmt::Display for ConfigError {
                     path.display()
                 )
             }
+            Self::RelativeBackupDirectory { path } => write!(
+                formatter,
+                "config.backup_dir must be an absolute path: {}",
+                path.display()
+            ),
+            Self::ResolveBackupDirectory { path, source } => write!(
+                formatter,
+                "could not resolve backup directory {}: {source}",
+                path.display()
+            ),
+            Self::CreateBackupDirectory { path, source } => write!(
+                formatter,
+                "could not create backup directory {}: {source}",
+                path.display()
+            ),
             Self::ResolvePkgsDirectory { path, source } => write!(
                 formatter,
                 "could not resolve packages directory {}: {source}",
@@ -540,7 +624,6 @@ impl fmt::Display for ConfigError {
                 "could not create config directory {}: {source}",
                 path.display()
             ),
-            Self::Serialize(source) => write!(formatter, "could not serialize config: {source}"),
             Self::WriteConfig { path, source } => write!(
                 formatter,
                 "could not write config {}: {source}",
@@ -582,10 +665,12 @@ impl Error for ConfigError {
             Self::HomeNotFound => None,
             Self::CurrentDirectory(source) => Some(source),
             Self::RelativePkgsDirectory { .. } => None,
-            Self::ResolvePkgsDirectory { source, .. } => Some(source),
+            Self::RelativeBackupDirectory { .. } => None,
+            Self::ResolveBackupDirectory { source, .. }
+            | Self::CreateBackupDirectory { source, .. }
+            | Self::ResolvePkgsDirectory { source, .. } => Some(source),
             Self::PkgsDirectoryNotDirectory { .. } => None,
             Self::CreateConfigDirectory { source, .. } => Some(source),
-            Self::Serialize(source) => Some(source),
             Self::WriteConfig { source, .. } => Some(source),
             Self::ReplaceConfig { source, .. } => Some(source),
             Self::Read { source, .. } => Some(source),
@@ -649,268 +734,4 @@ impl fmt::Display for EvaluationError {
 impl Error for EvaluationError {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn context() -> EvaluationContext {
-        EvaluationContext {
-            home: PathBuf::from("/home/tester"),
-            root: PathBuf::from("/"),
-            current_dir: PathBuf::from("/work/dotfiles"),
-        }
-    }
-
-    #[test]
-    fn resolves_builtins_and_variable_references() {
-        let raw: RawConfig = serde_yaml::from_str(
-            r#"
-config:
-  pkgs_dir: /repos/dotfiles
-variables:
-  config_home: ${home}/.config
-  local_bin: ${home}/.local/bin
-  dtm_config: ${config_home}/dtm
-  system_config: ${root}/etc/dtm
-unknown:
-  ignored: true
-"#,
-        )
-        .expect("valid config");
-
-        let variables = resolve_variables(&raw.variables, &context()).expect("resolve variables");
-
-        assert_eq!(raw.config.pkgs_dir, Some(PathBuf::from("/repos/dotfiles")));
-        assert_eq!(variables["home"], "/home/tester");
-        assert_eq!(variables["root"], "/");
-        assert!(!variables.contains_key("_pkgs_dir"));
-        assert_eq!(variables["config_home"], "/home/tester/.config");
-        assert_eq!(variables["local_bin"], "/home/tester/.local/bin");
-        assert_eq!(variables["dtm_config"], "/home/tester/.config/dtm");
-        assert_eq!(variables["system_config"], "/etc/dtm");
-    }
-
-    #[test]
-    fn configured_values_override_predefined_variables() {
-        let variables = BTreeMap::from([
-            ("home".to_owned(), "/custom/home".to_owned()),
-            ("root".to_owned(), "/custom/root".to_owned()),
-            ("config_home".to_owned(), "${home}/.config".to_owned()),
-            ("system_config".to_owned(), "${root}/etc/dtm".to_owned()),
-        ]);
-
-        let resolved = resolve_variables(&variables, &context()).expect("resolve variables");
-
-        assert_eq!(resolved["home"], "/custom/home");
-        assert_eq!(resolved["root"], "/custom/root");
-        assert_eq!(resolved["config_home"], "/custom/home/.config");
-        assert_eq!(resolved["system_config"], "/custom/root/etc/dtm");
-    }
-
-    #[test]
-    fn resolves_pkgs_directory_priority() {
-        let context = context();
-
-        assert_eq!(
-            resolve_pkgs_dir(Some(Path::new("/configured")), &context, None)
-                .expect("configured path"),
-            PathBuf::from("/configured")
-        );
-        assert_eq!(
-            resolve_pkgs_dir(
-                Some(Path::new("/configured")),
-                &context,
-                Some(Path::new("relative-cli")),
-            )
-            .expect("command-line path"),
-            PathBuf::from("/work/dotfiles/relative-cli")
-        );
-        assert_eq!(
-            resolve_pkgs_dir(None, &context, None).expect("current path"),
-            PathBuf::from("/work/dotfiles")
-        );
-    }
-
-    #[test]
-    fn rejects_relative_configured_pkgs_directory() {
-        let error = resolve_pkgs_dir(Some(Path::new("relative")), &context(), None)
-            .expect_err("relative configured path");
-
-        assert!(matches!(error, ConfigError::RelativePkgsDirectory { .. }));
-    }
-
-    #[test]
-    fn rejects_unknown_references() {
-        let variables = BTreeMap::from([("config_home".to_owned(), "${missing}/dtm".to_owned())]);
-        let error = resolve_variables(&variables, &context()).expect_err("unknown reference");
-
-        assert!(matches!(
-            error,
-            EvaluationError::UnknownReference { reference, .. } if reference == "missing"
-        ));
-    }
-
-    #[test]
-    fn rejects_cyclic_references() {
-        let variables = BTreeMap::from([
-            ("a".to_owned(), "${b}".to_owned()),
-            ("b".to_owned(), "${a}".to_owned()),
-        ]);
-        let error = resolve_variables(&variables, &context()).expect_err("cycle");
-
-        assert!(matches!(error, EvaluationError::Cycle { .. }));
-    }
-
-    #[test]
-    fn loads_configured_pkgs_directory() {
-        let path = temporary_path("configured-dot-dir");
-        fs::write(
-            &path,
-            "config:\n  pkgs_dir: /configured/dotfiles\nvariables:\n  config_home: /tmp/config\n",
-        )
-        .expect("write fixture");
-
-        let config = Config::load(Some(&path), None).expect("load config");
-
-        assert_eq!(
-            config.config.pkgs_dir,
-            PathBuf::from("/configured/dotfiles")
-        );
-        assert_eq!(config.variables["home"], fixture_home());
-        assert_eq!(config.variables["root"], "/");
-        assert!(!config.variables.contains_key("_pkgs_dir"));
-        assert_eq!(config.variables["config_home"], "/tmp/config");
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn defaults_pkgs_directory_to_current_directory() {
-        let path = temporary_path("default-dot-dir");
-        fs::write(&path, "variables: {}\n").expect("write fixture");
-
-        let config = Config::load(Some(&path), None).expect("load config");
-
-        assert_eq!(config.config.pkgs_dir, env::current_dir().unwrap());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn command_line_pkgs_directory_overrides_config() {
-        let path = temporary_path("dot-dir-override");
-        fs::write(&path, "config:\n  pkgs_dir: /configured/dotfiles\n").expect("write fixture");
-
-        let config =
-            Config::load(Some(&path), Some(Path::new("/cli/dotfiles"))).expect("load config");
-
-        assert_eq!(config.config.pkgs_dir, PathBuf::from("/cli/dotfiles"));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn configured_pkgs_directory_is_absent_when_not_in_file() {
-        let path = temporary_path("list-without-pkgs-dir");
-        fs::write(&path, "variables:\n  home_name: tester\n").expect("write fixture");
-
-        assert_eq!(configured_pkgs_dir(Some(&path)).expect("read config"), None);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn set_pkgs_directory_preserves_yaml_layout_and_comments() {
-        let fixture = temporary_path("preserve-pkgs-dir-layout");
-        fs::create_dir_all(&fixture).expect("create fixture");
-        let pkgs_dir = fixture.join("packages");
-        fs::create_dir_all(&pkgs_dir).expect("create packages directory");
-        let path = fixture.join("config.yaml");
-        let original = "# Keep this header.\nvariables:\n  config_home: /tmp/config\n\n# Keep variables above config.\nconfig:\n  # Existing package directory.\n  old: value\n\n# Keep this trailing comment.\n";
-        fs::write(&path, original).expect("write config");
-
-        set_pkgs_dir(Some(&path), &pkgs_dir).expect("set packages directory");
-        let updated = fs::read_to_string(&path).expect("read updated config");
-
-        assert!(updated.starts_with("# Keep this header.\nvariables:\n"));
-        assert!(updated.find("variables:").unwrap() < updated.find("config:").unwrap());
-        assert!(updated.contains("# Keep variables above config.\n"));
-        assert!(updated.contains("  # Existing package directory.\n"));
-        assert!(updated.contains(&format!(
-            "  pkgs_dir: {}\n\n# Keep this trailing comment.\n",
-            pkgs_dir.display()
-        )));
-        assert!(updated.ends_with("# Keep this trailing comment.\n"));
-
-        let _ = fs::remove_dir_all(fixture);
-    }
-
-    #[test]
-    fn set_pkgs_directory_creates_and_updates_config() {
-        let fixture = temporary_path("set-pkgs-dir");
-        fs::create_dir_all(&fixture).expect("create fixture");
-        let first_pkgs_dir = fixture.join("first");
-        let second_pkgs_dir = fixture.join("second");
-        let config_path = fixture.join("config/dtm/config.yaml");
-        fs::create_dir_all(&first_pkgs_dir).expect("create first packages directory");
-        fs::create_dir_all(&second_pkgs_dir).expect("create second packages directory");
-
-        let (written_path, written_pkgs_dir) =
-            set_pkgs_dir(Some(&config_path), &first_pkgs_dir).expect("set packages directory");
-        assert_eq!(written_path, config_path);
-        assert_eq!(written_pkgs_dir, first_pkgs_dir.canonicalize().unwrap());
-
-        let mut raw: RawConfig =
-            serde_yaml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        raw.variables
-            .insert("config_home".to_owned(), "/tmp/config".to_owned());
-        fs::write(&config_path, serde_yaml::to_string(&raw).unwrap()).unwrap();
-
-        set_pkgs_dir(Some(&config_path), &second_pkgs_dir).expect("update packages directory");
-        let config = Config::load(Some(&config_path), None).expect("load updated config");
-        assert_eq!(
-            config.config.pkgs_dir,
-            second_pkgs_dir.canonicalize().unwrap()
-        );
-        assert_eq!(config.variables["config_home"], "/tmp/config");
-
-        let _ = fs::remove_dir_all(fixture);
-    }
-
-    #[test]
-    fn set_pkgs_directory_rejects_missing_or_non_directory_paths() {
-        let config_path = temporary_path("invalid-set-config");
-        let missing = temporary_path("missing-pkgs-dir");
-        let error = set_pkgs_dir(Some(&config_path), &missing).expect_err("missing path");
-        assert!(matches!(error, ConfigError::ResolvePkgsDirectory { .. }));
-
-        let file = temporary_path("pkgs-dir-file");
-        fs::write(&file, "not a directory").unwrap();
-        let error = set_pkgs_dir(Some(&config_path), &file).expect_err("ordinary file");
-        assert!(matches!(
-            error,
-            ConfigError::PkgsDirectoryNotDirectory { .. }
-        ));
-        let _ = fs::remove_file(file);
-    }
-
-    #[test]
-    fn default_path_uses_xdg_shape() {
-        let path = PathBuf::from("/tmp/example-config");
-        assert_eq!(
-            config_path(&path),
-            PathBuf::from("/tmp/example-config/dtm/config.yaml")
-        );
-    }
-
-    fn fixture_home() -> String {
-        env::var("HOME").expect("HOME is set for tests")
-    }
-
-    fn temporary_path(name: &str) -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        env::temp_dir().join(format!(
-            "dtm-config-{name}-{}-{timestamp}.yaml",
-            std::process::id()
-        ))
-    }
-}
+mod tests;

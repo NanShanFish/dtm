@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -26,23 +26,36 @@ pub enum EntryKind {
     Template,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ApplyMode {
+    #[default]
     Normal,
     SemiForce,
     Force,
-}
-
-impl Default for ApplyMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     pub applied: Vec<PackageEntry>,
     pub skipped: Vec<SkippedEntry>,
+    pub backups: Vec<BackupEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupEntry {
+    pub original: PathBuf,
+    pub backup: PathBuf,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub restored: Vec<RestoredEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredEntry {
+    pub backup: PathBuf,
+    pub target: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,11 +149,28 @@ impl PackagePlan {
         variables: &BTreeMap<String, String>,
         mode: ApplyMode,
     ) -> Result<ApplyReport, PackageError> {
+        self.apply_with_backup(variables, mode, None)
+    }
+
+    pub fn apply_with_backup(
+        &self,
+        variables: &BTreeMap<String, String>,
+        mode: ApplyMode,
+        backup_dir: Option<&Path>,
+    ) -> Result<ApplyReport, PackageError> {
         let mut report = ApplyReport::default();
 
         for entry in &self.entries {
-            match apply_entry(entry, variables, mode)? {
-                EntryAction::Applied => report.applied.push(entry.clone()),
+            let backup_path = backup_dir
+                .map(|backup_dir| self.backup_path(entry, variables, backup_dir))
+                .transpose()?;
+            match apply_entry(entry, variables, mode, backup_path.as_deref())? {
+                EntryAction::Applied(backup) => {
+                    report.applied.push(entry.clone());
+                    if let Some(backup) = backup {
+                        report.backups.push(backup);
+                    }
+                }
                 EntryAction::Skipped(reason) => report.skipped.push(SkippedEntry {
                     entry: entry.clone(),
                     reason,
@@ -150,11 +180,131 @@ impl PackagePlan {
 
         Ok(report)
     }
+
+    pub fn restore(
+        &self,
+        variables: &BTreeMap<String, String>,
+        backup_dir: &Path,
+    ) -> Result<RestoreReport, PackageError> {
+        let package_backup = backup_dir.join(&self.name);
+        let metadata = fs::symlink_metadata(&package_backup).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                PackageError::BackupPackageNotFound {
+                    path: package_backup.clone(),
+                }
+            } else {
+                PackageError::ReadMetadata {
+                    path: package_backup.clone(),
+                    source,
+                }
+            }
+        })?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(PackageError::InvalidBackupEntry {
+                path: package_backup,
+            });
+        }
+
+        let mut pending = Vec::new();
+        let mut directories = vec![package_backup.clone()];
+        let mut targets = BTreeSet::new();
+        let variable_directories = sorted_directory_entries(&package_backup)?;
+
+        for variable_directory in variable_directories {
+            let path = variable_directory.path();
+            let file_type =
+                variable_directory
+                    .file_type()
+                    .map_err(|source| PackageError::ReadMetadata {
+                        path: path.clone(),
+                        source,
+                    })?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(PackageError::InvalidBackupEntry { path });
+            }
+
+            let variable = variable_directory
+                .file_name()
+                .into_string()
+                .map_err(|_| PackageError::InvalidBackupEntry { path: path.clone() })?;
+            let target_root = variables.get(&variable).map(PathBuf::from).ok_or_else(|| {
+                PackageError::UnknownBackupVariable {
+                    path: path.clone(),
+                    variable: variable.clone(),
+                }
+            })?;
+            if !target_root.is_absolute() {
+                return Err(PackageError::RelativeVariablePath {
+                    variable,
+                    value: target_root,
+                });
+            }
+
+            directories.push(path.clone());
+            scan_restore_directory(
+                &path,
+                &path,
+                &target_root,
+                self,
+                variables,
+                &mut pending,
+                &mut directories,
+                &mut targets,
+            )?;
+        }
+
+        if pending.is_empty() {
+            return Err(PackageError::BackupPackageEmpty {
+                path: package_backup,
+            });
+        }
+
+        let mut report = RestoreReport::default();
+        for restore in pending {
+            remove_target(&restore.target)?;
+            fs::rename(&restore.backup, &restore.target).map_err(|source| {
+                PackageError::RestoreBackup {
+                    backup: restore.backup.clone(),
+                    target: restore.target.clone(),
+                    source,
+                }
+            })?;
+            report.restored.push(restore);
+        }
+
+        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        directories.dedup();
+        for directory in directories {
+            fs::remove_dir(&directory).map_err(|source| PackageError::RemoveBackupDirectory {
+                path: directory,
+                source,
+            })?;
+        }
+
+        Ok(report)
+    }
+
+    fn backup_path(
+        &self,
+        entry: &PackageEntry,
+        variables: &BTreeMap<String, String>,
+        backup_dir: &Path,
+    ) -> Result<PathBuf, PackageError> {
+        let (variable, target_relative) = nearest_variable_target(&entry.target, variables)
+            .ok_or_else(|| PackageError::InvalidBackupTarget {
+                path: entry.target.clone(),
+            })?;
+
+        Ok(backup_dir
+            .join(&self.name)
+            .join(variable)
+            .join(reverse_backup_path(&target_relative)?))
+    }
 }
 
 #[derive(Debug)]
 enum EntryAction {
-    Applied,
+    Applied(Option<BackupEntry>),
     Skipped(String),
 }
 
@@ -162,6 +312,7 @@ fn apply_entry(
     entry: &PackageEntry,
     variables: &BTreeMap<String, String>,
     mode: ApplyMode,
+    backup_dir: Option<&Path>,
 ) -> Result<EntryAction, PackageError> {
     let rendered = match entry.kind {
         EntryKind::Symlink => None,
@@ -179,6 +330,7 @@ fn apply_entry(
         }
     };
 
+    let mut backup = None;
     if let Some(metadata) = target_metadata {
         if metadata.file_type().is_dir() {
             return Err(PackageError::TargetIsDirectory {
@@ -190,17 +342,21 @@ fn apply_entry(
             return Ok(EntryAction::Skipped("already up to date".to_owned()));
         }
 
-        let should_remove = match mode {
+        let should_replace = match mode {
             ApplyMode::Normal => false,
             ApplyMode::SemiForce => metadata.file_type().is_symlink(),
             ApplyMode::Force => true,
         };
 
-        if !should_remove {
+        if !should_replace {
             return Ok(EntryAction::Skipped("target already exists".to_owned()));
         }
 
-        remove_target(&entry.target, metadata.file_type().is_symlink())?;
+        if let Some(backup_dir) = backup_dir {
+            backup = Some(move_target_to_backup(&entry.target, backup_dir)?);
+        } else {
+            remove_target(&entry.target)?;
+        }
     }
 
     if let Some(parent) = entry.target.parent() {
@@ -220,16 +376,27 @@ fn apply_entry(
         None => create_symlink(&entry.source, &entry.target)?,
     }
 
-    Ok(EntryAction::Applied)
+    Ok(EntryAction::Applied(backup))
 }
 
 fn target_is_current_entry(
     entry: &PackageEntry,
     rendered: Option<&str>,
 ) -> Result<bool, PackageError> {
+    let metadata = match fs::symlink_metadata(&entry.target) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(PackageError::ReadMetadata {
+                path: entry.target.clone(),
+                source,
+            });
+        }
+    };
+
     match entry.kind {
         EntryKind::Symlink => {
-            if !entry.target.is_symlink() {
+            if !metadata.file_type().is_symlink() {
                 return Ok(false);
             }
             let target = fs::read_link(&entry.target).map_err(|source| PackageError::ReadLink {
@@ -242,7 +409,7 @@ fn target_is_current_entry(
             let Some(rendered) = rendered else {
                 return Ok(false);
             };
-            if entry.target.is_symlink() {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                 return Ok(false);
             }
             let existing = fs::read(&entry.target).map_err(|source| PackageError::ReadFile {
@@ -254,16 +421,46 @@ fn target_is_current_entry(
     }
 }
 
-fn remove_target(path: &Path, is_symlink: bool) -> Result<(), PackageError> {
-    let result = if is_symlink {
-        fs::remove_file(path)
-    } else {
-        fs::remove_file(path)
-    };
-    result.map_err(|source| PackageError::RemoveTarget {
+fn remove_target(path: &Path) -> Result<(), PackageError> {
+    fs::remove_file(path).map_err(|source| PackageError::RemoveTarget {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn move_target_to_backup(target: &Path, backup: &Path) -> Result<BackupEntry, PackageError> {
+    if path_exists(backup)? {
+        return Err(PackageError::BackupAlreadyExists {
+            path: backup.to_path_buf(),
+        });
+    }
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent).map_err(|source| PackageError::CreateBackupDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::rename(target, backup).map_err(|source| PackageError::MoveToBackup {
+        source_path: target.to_path_buf(),
+        backup: backup.to_path_buf(),
+        source,
+    })?;
+
+    Ok(BackupEntry {
+        original: target.to_path_buf(),
+        backup: backup.to_path_buf(),
+    })
+}
+
+fn path_exists(path: &Path) -> Result<bool, PackageError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(PackageError::ReadMetadata {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(unix)]
@@ -273,6 +470,165 @@ fn create_symlink(source: &Path, target: &Path) -> Result<(), PackageError> {
         target: target.to_path_buf(),
         source_error,
     })
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_source: &Path, _target: &Path) -> Result<(), PackageError> {
+    Err(PackageError::UnsupportedPlatform)
+}
+
+fn nearest_variable_target<'a>(
+    target: &Path,
+    variables: &'a BTreeMap<String, String>,
+) -> Option<(&'a str, PathBuf)> {
+    variables
+        .iter()
+        .filter_map(|(name, value)| {
+            let root = Path::new(value);
+            if !root.is_absolute() {
+                return None;
+            }
+            let relative = target.strip_prefix(root).ok()?;
+            Some((
+                name.as_str(),
+                relative.to_path_buf(),
+                root.components().count(),
+            ))
+        })
+        .max_by(|left, right| left.2.cmp(&right.2).then_with(|| right.0.cmp(left.0)))
+        .map(|(name, relative, _)| (name, relative))
+}
+
+fn reverse_backup_path(path: &Path) -> Result<PathBuf, PackageError> {
+    map_backup_path(path, true)
+}
+
+fn restore_backup_path(path: &Path) -> Result<PathBuf, PackageError> {
+    map_backup_path(path, false)
+}
+
+fn map_backup_path(path: &Path, reverse: bool) -> Result<PathBuf, PackageError> {
+    let mut mapped = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return Err(PackageError::InvalidBackupTarget {
+                path: path.to_path_buf(),
+            });
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| PackageError::InvalidBackupTarget {
+                path: path.to_path_buf(),
+            })?;
+        let mapped_name = if reverse {
+            name.strip_prefix('.')
+                .filter(|suffix| !suffix.is_empty())
+                .map(|suffix| format!("dot-{suffix}"))
+                .unwrap_or_else(|| name.to_owned())
+        } else {
+            name.strip_prefix("dot-")
+                .filter(|suffix| !suffix.is_empty())
+                .map(|suffix| format!(".{suffix}"))
+                .unwrap_or_else(|| name.to_owned())
+        };
+        mapped.push(mapped_name);
+    }
+
+    if mapped.as_os_str().is_empty() {
+        return Err(PackageError::InvalidBackupTarget {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(mapped)
+}
+
+fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>, PackageError> {
+    let entries = fs::read_dir(path).map_err(|source| PackageError::ReadDirectory {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut entries = entries
+        .map(|entry| {
+            entry.map_err(|source| PackageError::ReadDirectory {
+                path: path.to_path_buf(),
+                source,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_restore_directory(
+    directory: &Path,
+    variable_backup_root: &Path,
+    target_root: &Path,
+    plan: &PackagePlan,
+    variables: &BTreeMap<String, String>,
+    pending: &mut Vec<RestoredEntry>,
+    directories: &mut Vec<PathBuf>,
+    targets: &mut BTreeSet<PathBuf>,
+) -> Result<(), PackageError> {
+    for backup_entry in sorted_directory_entries(directory)? {
+        let backup = backup_entry.path();
+        let file_type = backup_entry
+            .file_type()
+            .map_err(|source| PackageError::ReadMetadata {
+                path: backup.clone(),
+                source,
+            })?;
+
+        if file_type.is_dir() && !file_type.is_symlink() {
+            directories.push(backup.clone());
+            scan_restore_directory(
+                &backup,
+                variable_backup_root,
+                target_root,
+                plan,
+                variables,
+                pending,
+                directories,
+                targets,
+            )?;
+            continue;
+        }
+        if !file_type.is_file() && !file_type.is_symlink() {
+            return Err(PackageError::InvalidBackupEntry { path: backup });
+        }
+
+        let relative = backup.strip_prefix(variable_backup_root).map_err(|_| {
+            PackageError::InvalidBackupEntry {
+                path: backup.clone(),
+            }
+        })?;
+        let target_relative = restore_backup_path(relative)?;
+        if reverse_backup_path(&target_relative)? != relative {
+            return Err(PackageError::InvalidBackupEntry { path: backup });
+        }
+        let target = target_root.join(target_relative);
+        if !targets.insert(target.clone()) {
+            return Err(PackageError::DuplicateRestoreTarget { path: target });
+        }
+        let entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.target == target)
+            .ok_or_else(|| PackageError::BackupTargetNotInPackage {
+                backup: backup.clone(),
+                target: target.clone(),
+            })?;
+        let rendered = match entry.kind {
+            EntryKind::Symlink => None,
+            EntryKind::Template => Some(render_template(&entry.source, variables)?),
+        };
+        if !target_is_current_entry(entry, rendered.as_deref())? {
+            return Err(PackageError::RestoreTargetNotManaged { path: target });
+        }
+
+        pending.push(RestoredEntry { backup, target });
+    }
+    Ok(())
 }
 
 fn validate_package_name(name: &str) -> Result<(), PackageError> {
@@ -484,6 +840,53 @@ pub enum PackageError {
         path: PathBuf,
         source: std::io::Error,
     },
+    CreateBackupDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    MoveToBackup {
+        source_path: PathBuf,
+        backup: PathBuf,
+        source: std::io::Error,
+    },
+    InvalidBackupTarget {
+        path: PathBuf,
+    },
+    BackupAlreadyExists {
+        path: PathBuf,
+    },
+    BackupPackageNotFound {
+        path: PathBuf,
+    },
+    BackupPackageEmpty {
+        path: PathBuf,
+    },
+    InvalidBackupEntry {
+        path: PathBuf,
+    },
+    UnknownBackupVariable {
+        path: PathBuf,
+        variable: String,
+    },
+    BackupTargetNotInPackage {
+        backup: PathBuf,
+        target: PathBuf,
+    },
+    DuplicateRestoreTarget {
+        path: PathBuf,
+    },
+    RestoreTargetNotManaged {
+        path: PathBuf,
+    },
+    RestoreBackup {
+        backup: PathBuf,
+        target: PathBuf,
+        source: std::io::Error,
+    },
+    RemoveBackupDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     CreateLink {
         source: PathBuf,
         target: PathBuf,
@@ -496,6 +899,7 @@ pub enum PackageError {
         path: PathBuf,
         variable: String,
     },
+    #[cfg(not(unix))]
     UnsupportedPlatform,
 }
 
@@ -593,6 +997,82 @@ impl fmt::Display for PackageError {
                     path.display()
                 )
             }
+            Self::CreateBackupDirectory { path, source } => write!(
+                formatter,
+                "could not create backup directory {}: {source}",
+                path.display()
+            ),
+            Self::MoveToBackup {
+                source_path,
+                backup,
+                source,
+            } => write!(
+                formatter,
+                "could not move {} to backup {}: {source}",
+                source_path.display(),
+                backup.display()
+            ),
+            Self::InvalidBackupTarget { path } => write!(
+                formatter,
+                "could not derive a backup path for {}",
+                path.display()
+            ),
+            Self::BackupAlreadyExists { path } => write!(
+                formatter,
+                "backup already exists, restore it before stowing again: {}",
+                path.display()
+            ),
+            Self::BackupPackageNotFound { path } => {
+                write!(
+                    formatter,
+                    "package backup does not exist: {}",
+                    path.display()
+                )
+            }
+            Self::BackupPackageEmpty { path } => {
+                write!(formatter, "package backup is empty: {}", path.display())
+            }
+            Self::InvalidBackupEntry { path } => write!(
+                formatter,
+                "invalid file or directory in package backup: {}",
+                path.display()
+            ),
+            Self::UnknownBackupVariable { path, variable } => write!(
+                formatter,
+                "backup directory {} references unknown variable '{variable}'",
+                path.display()
+            ),
+            Self::BackupTargetNotInPackage { backup, target } => write!(
+                formatter,
+                "backup {} maps to {}, which is not managed by this package",
+                backup.display(),
+                target.display()
+            ),
+            Self::DuplicateRestoreTarget { path } => write!(
+                formatter,
+                "multiple backup files map to restore target {}",
+                path.display()
+            ),
+            Self::RestoreTargetNotManaged { path } => write!(
+                formatter,
+                "refusing to restore over a target not currently managed by dtm: {}",
+                path.display()
+            ),
+            Self::RestoreBackup {
+                backup,
+                target,
+                source,
+            } => write!(
+                formatter,
+                "could not restore backup {} to {}: {source}",
+                backup.display(),
+                target.display()
+            ),
+            Self::RemoveBackupDirectory { path, source } => write!(
+                formatter,
+                "could not remove restored backup directory {}: {source}",
+                path.display()
+            ),
             Self::CreateLink {
                 source,
                 target,
@@ -613,6 +1093,7 @@ impl fmt::Display for PackageError {
                 "template {} references unknown variable '{variable}'",
                 path.display()
             ),
+            #[cfg(not(unix))]
             Self::UnsupportedPlatform => {
                 write!(
                     formatter,
@@ -633,6 +1114,10 @@ impl Error for PackageError {
             | Self::CreateDirectory { source, .. }
             | Self::WriteFile { source, .. }
             | Self::RemoveTarget { source, .. }
+            | Self::CreateBackupDirectory { source, .. }
+            | Self::MoveToBackup { source, .. }
+            | Self::RestoreBackup { source, .. }
+            | Self::RemoveBackupDirectory { source, .. }
             | Self::CreateLink {
                 source_error: source,
                 ..
@@ -643,329 +1128,4 @@ impl Error for PackageError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn reads_regular_and_template_files_from_a_package() {
-        let fixture = TemporaryDirectory::new("package-files");
-        let pkgs_dir = fixture.path();
-        let package = pkgs_dir.join("tmux");
-        fs::create_dir_all(package.join(".dtm/hooks")).expect("create metadata");
-        fs::create_dir_all(package.join("config_home/tmux")).expect("create package files");
-        fs::write(package.join(".dtm/config.yaml"), "hooks: {}\n").expect("write metadata");
-        fs::write(package.join(".dtm/hooks/post-install.sh"), "#!/bin/sh\n").expect("write hook");
-        fs::write(
-            package.join("config_home/tmux/tmux.conf"),
-            "set -g status on\n",
-        )
-        .expect("write regular file");
-
-        let variables =
-            BTreeMap::from([("config_home".to_owned(), "/home/tester/.config".to_owned())]);
-        let plan = PackagePlan::load(pkgs_dir, "tmux", &variables).expect("load package");
-
-        assert_eq!(plan.entries.len(), 1);
-        assert_eq!(
-            plan.entries[0],
-            PackageEntry {
-                source: package.join("config_home/tmux/tmux.conf"),
-                target: PathBuf::from("/home/tester/.config/tmux/tmux.conf"),
-                kind: EntryKind::Symlink,
-            }
-        );
-    }
-
-    #[test]
-    fn maps_dot_prefixed_files_to_hidden_targets() {
-        let fixture = TemporaryDirectory::new("hidden-file");
-        let pkgs_dir = fixture.path();
-        let package = pkgs_dir.join("git");
-        fs::create_dir_all(package.join("home")).expect("create package files");
-        fs::write(package.join("home/dot-gitconfig"), "[user]\n").expect("write file");
-
-        let variables = BTreeMap::from([("home".to_owned(), "/home/tester".to_owned())]);
-        let plan = PackagePlan::load(pkgs_dir, "git", &variables).expect("load package");
-
-        assert_eq!(
-            plan.entries,
-            vec![PackageEntry {
-                source: package.join("home/dot-gitconfig"),
-                target: PathBuf::from("/home/tester/.gitconfig"),
-                kind: EntryKind::Symlink,
-            }]
-        );
-    }
-
-    #[test]
-    fn reads_template_files_and_removes_the_template_marker() {
-        let fixture = TemporaryDirectory::new("template-file");
-        let pkgs_dir = fixture.path();
-        let package = pkgs_dir.join("tmux");
-        fs::create_dir_all(package.join("config_home/tmux")).expect("create package files");
-        fs::write(
-            package.join("config_home/tmux/tmux.tmpl.conf"),
-            "set -g status {=enabled=}\n",
-        )
-        .expect("write template file");
-
-        let variables =
-            BTreeMap::from([("config_home".to_owned(), "/home/tester/.config".to_owned())]);
-        let plan = PackagePlan::load(pkgs_dir, "tmux", &variables).expect("load package");
-
-        assert_eq!(
-            plan.entries,
-            vec![PackageEntry {
-                source: package.join("config_home/tmux/tmux.tmpl.conf"),
-                target: PathBuf::from("/home/tester/.config/tmux/tmux.conf"),
-                kind: EntryKind::Template,
-            }]
-        );
-    }
-
-    #[test]
-    fn classifies_deployment_names_when_removing_the_last_template_marker() {
-        assert_eq!(
-            deployment_name(std::ffi::OsStr::new("dot-gitconfig")),
-            Some((EntryKind::Symlink, ".gitconfig".into()))
-        );
-        assert_eq!(
-            deployment_name(std::ffi::OsStr::new("dot-gitconfig.tmpl")),
-            Some((EntryKind::Template, ".gitconfig".into()))
-        );
-        assert_eq!(
-            deployment_name(std::ffi::OsStr::new("tmux.conf.tmpl")),
-            Some((EntryKind::Template, "tmux.conf".into()))
-        );
-        assert_eq!(
-            deployment_name(std::ffi::OsStr::new("tmux.tmpl.conf")),
-            Some((EntryKind::Template, "tmux.conf".into()))
-        );
-        assert_eq!(
-            deployment_name(std::ffi::OsStr::new("app.tmpl.backup.tmpl")),
-            Some((EntryKind::Template, "app.tmpl.backup".into()))
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_variable_directory() {
-        let fixture = TemporaryDirectory::new("unknown-variable");
-        fs::create_dir_all(fixture.path().join("pkg/missing/file")).expect("create package");
-
-        let error = PackagePlan::load(fixture.path(), "pkg", &BTreeMap::new())
-            .expect_err("unknown variable");
-
-        assert!(
-            matches!(error, PackageError::UnknownVariableDirectory { variable, .. } if variable == "missing")
-        );
-    }
-
-    #[test]
-    fn rejects_files_at_package_root() {
-        let fixture = TemporaryDirectory::new("root-file");
-        let package = fixture.path().join("pkg");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(package.join("script.sh"), "#!/bin/sh\n").expect("write file");
-
-        let error =
-            PackagePlan::load(fixture.path(), "pkg", &BTreeMap::new()).expect_err("root file");
-
-        assert!(matches!(error, PackageError::UnexpectedRootEntry { .. }));
-    }
-
-    #[test]
-    fn rejects_duplicate_targets_created_by_template_name() {
-        let fixture = TemporaryDirectory::new("target-collision");
-        let package = fixture.path().join("pkg/config/file");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(package.join("app.conf"), "plain\n").expect("write file");
-        fs::write(package.join("app.conf.tmpl"), "template\n").expect("write file");
-
-        let variables = BTreeMap::from([("config".to_owned(), "/tmp/config".to_owned())]);
-        let error =
-            PackagePlan::load(fixture.path(), "pkg", &variables).expect_err("target collision");
-
-        assert!(matches!(error, PackageError::TargetCollision { .. }));
-    }
-
-    #[test]
-    fn applies_a_symlink_and_a_template() {
-        let fixture = TemporaryDirectory::new("apply");
-        let pkgs_dir = fixture.path().join("dotfiles");
-        let package = pkgs_dir.join("pkg/home");
-        let target_home = fixture.path().join("target");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(package.join("dot-config"), "linked\n").expect("write source");
-        fs::write(package.join("dot-settings.conf.tmpl"), "home={=home=}\n")
-            .expect("write template");
-
-        let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
-        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
-        let report = plan
-            .apply(&variables, ApplyMode::Normal)
-            .expect("apply package");
-
-        assert_eq!(report.applied.len(), 2);
-        assert_eq!(
-            fs::read_link(target_home.join(".config")).unwrap(),
-            package.join("dot-config")
-        );
-        assert_eq!(
-            fs::read_to_string(target_home.join(".settings.conf")).expect("read template"),
-            format!("home={}\n", target_home.display())
-        );
-    }
-
-    #[test]
-    fn normal_mode_skips_different_targets_and_semi_force_replaces_only_links() {
-        let fixture = TemporaryDirectory::new("modes");
-        let pkgs_dir = fixture.path().join("dotfiles");
-        let package = pkgs_dir.join("pkg/home");
-        let target_home = fixture.path().join("target");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(package.join("dot-config"), "source\n").expect("write source");
-        fs::create_dir_all(&target_home).expect("create target");
-        fs::write(target_home.join(".config"), "existing\n").expect("write target");
-
-        let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
-        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
-        let report = plan
-            .apply(&variables, ApplyMode::Normal)
-            .expect("normal apply");
-        assert_eq!(report.skipped.len(), 1);
-        assert_eq!(
-            fs::read_to_string(target_home.join(".config")).unwrap(),
-            "existing\n"
-        );
-
-        let report = plan
-            .apply(&variables, ApplyMode::SemiForce)
-            .expect("semi-force apply");
-        assert_eq!(report.applied.len(), 0);
-        assert_eq!(report.skipped.len(), 1);
-
-        fs::remove_file(target_home.join(".config")).expect("remove ordinary target");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(package.join("dot-config"), target_home.join(".config"))
-            .expect("create existing link");
-        let report = plan
-            .apply(&variables, ApplyMode::SemiForce)
-            .expect("semi-force link apply");
-        assert_eq!(report.applied.len(), 0);
-        assert_eq!(report.skipped[0].reason, "already up to date");
-        assert_eq!(
-            fs::read_link(target_home.join(".config")).unwrap(),
-            package.join("dot-config")
-        );
-    }
-
-    #[test]
-    fn force_replaces_an_existing_regular_file() {
-        let fixture = TemporaryDirectory::new("force");
-        let pkgs_dir = fixture.path().join("dotfiles");
-        let package = pkgs_dir.join("pkg/home");
-        let target_home = fixture.path().join("target");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(package.join("dot-config"), "source\n").expect("write source");
-        fs::create_dir_all(&target_home).expect("create target");
-        fs::write(target_home.join(".config"), "existing\n").expect("write target");
-
-        let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
-        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
-        let report = plan
-            .apply(&variables, ApplyMode::Force)
-            .expect("force apply");
-
-        assert_eq!(report.applied.len(), 1);
-        assert_eq!(
-            fs::read_link(target_home.join(".config")).unwrap(),
-            package.join("dot-config")
-        );
-    }
-
-    #[test]
-    fn template_compares_rendered_content_and_force_replaces_different_file() {
-        let fixture = TemporaryDirectory::new("template-conflict");
-        let pkgs_dir = fixture.path().join("dotfiles");
-        let package = pkgs_dir.join("pkg/home");
-        let target_home = fixture.path().join("target");
-        fs::create_dir_all(&package).expect("create package");
-        fs::write(package.join("settings.tmpl"), "name={=name=}\n").expect("write template");
-
-        let variables = BTreeMap::from([
-            ("home".to_owned(), target_home.display().to_string()),
-            ("name".to_owned(), "dtm".to_owned()),
-        ]);
-        let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
-        plan.apply(&variables, ApplyMode::Normal)
-            .expect("first apply");
-
-        let report = plan
-            .apply(&variables, ApplyMode::Normal)
-            .expect("second apply");
-        assert_eq!(report.applied.len(), 0);
-        assert_eq!(report.skipped[0].reason, "already up to date");
-
-        fs::write(target_home.join("settings"), "changed\n").expect("change generated file");
-        let report = plan
-            .apply(&variables, ApplyMode::Normal)
-            .expect("normal apply");
-        assert_eq!(report.skipped[0].reason, "target already exists");
-
-        let report = plan
-            .apply(&variables, ApplyMode::Force)
-            .expect("force apply");
-        assert_eq!(report.applied.len(), 1);
-        assert_eq!(
-            fs::read_to_string(target_home.join("settings")).expect("read generated file"),
-            "name=dtm\n"
-        );
-    }
-
-    #[test]
-    fn template_rejects_unknown_variables_and_preserves_unclosed_or_multiline_markers() {
-        let fixture = TemporaryDirectory::new("template-rendering");
-        let source = fixture.path().join("source.tmpl");
-        fs::write(&source, "known={=known=} unclosed={=unknown\n").expect("write template");
-        let variables = BTreeMap::from([("known".to_owned(), "value".to_owned())]);
-        assert_eq!(
-            render_template(&source, &variables).expect("render template"),
-            "known=value unclosed={=unknown\n"
-        );
-
-        fs::write(&source, "missing={=missing=}").expect("write unknown template");
-        let error = render_template(&source, &variables).expect_err("unknown variable");
-        assert!(matches!(
-            error,
-            PackageError::UnknownTemplateVariable { variable, .. } if variable == "missing"
-        ));
-    }
-
-    struct TemporaryDirectory(PathBuf);
-
-    impl TemporaryDirectory {
-        fn new(name: &str) -> Self {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "dtm-package-{name}-{}-{timestamp}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("create temporary directory");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TemporaryDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-}
+mod tests;
