@@ -57,6 +57,48 @@ fn parses_short_force_modes() {
 }
 
 #[test]
+fn parses_remove_in_safe_and_skip_unmanaged_modes() {
+    let safe = Cli::parse(strings(&["rm", "git"])).expect("safe remove");
+    assert_eq!(
+        safe.command,
+        Some(Command::Remove(RemoveCommand {
+            name: "git".to_owned(),
+            skip_unmanaged: false,
+        }))
+    );
+
+    let skip = Cli::parse(strings(&[
+        "--config",
+        "/tmp/config.yaml",
+        "rm",
+        "--skip-unmanaged",
+        "git",
+    ]))
+    .expect("remove while skipping unmanaged targets");
+    assert_eq!(skip.config, Some(PathBuf::from("/tmp/config.yaml")));
+    assert_eq!(
+        skip.command,
+        Some(Command::Remove(RemoveCommand {
+            name: "git".to_owned(),
+            skip_unmanaged: true,
+        }))
+    );
+}
+
+#[test]
+fn remove_rejects_unknown_options_and_extra_packages() {
+    assert_eq!(
+        Cli::parse(strings(&["rm", "--force", "git"])),
+        Err(CliError::UnknownArgument("--force".to_owned()))
+    );
+    assert_eq!(
+        Cli::parse(strings(&["rm", "git", "tmux"])),
+        Err(CliError::UnexpectedArgument("tmux".to_owned()))
+    );
+    assert_eq!(Cli::parse(strings(&["rm"])), Err(CliError::MissingPackage));
+}
+
+#[test]
 fn parses_restore_with_shared_config_option() {
     let cli = Cli::parse(strings(&["--config", "/tmp/config.yaml", "restore", "git"]))
         .expect("valid restore arguments");

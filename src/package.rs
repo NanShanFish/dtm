@@ -47,6 +47,19 @@ pub struct BackupEntry {
     pub backup: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RemoveMode {
+    #[default]
+    Safe,
+    SkipUnmanaged,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RemoveReport {
+    pub removed: Vec<PackageEntry>,
+    pub skipped: Vec<PackageEntry>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RestoreReport {
     pub restored: Vec<RestoredEntry>,
@@ -195,6 +208,42 @@ impl PackagePlan {
         Ok(report)
     }
 
+    pub fn remove(
+        &self,
+        template_values: &BTreeMap<String, String>,
+        mode: RemoveMode,
+    ) -> Result<RemoveReport, PackageError> {
+        let mut managed = Vec::new();
+        let mut unmanaged = Vec::new();
+
+        for entry in &self.entries {
+            let rendered = match entry.kind {
+                EntryKind::Symlink => None,
+                EntryKind::Template => Some(render_template(&entry.source, template_values)?),
+            };
+            if target_is_current_entry(entry, rendered.as_deref())? {
+                managed.push(entry.clone());
+            } else {
+                unmanaged.push(entry.clone());
+            }
+        }
+
+        if mode == RemoveMode::Safe && !unmanaged.is_empty() {
+            return Err(PackageError::UnmanagedTargets {
+                paths: unmanaged.iter().map(|entry| entry.target.clone()).collect(),
+            });
+        }
+
+        for entry in &managed {
+            remove_target(&entry.target)?;
+        }
+
+        Ok(RemoveReport {
+            removed: managed,
+            skipped: unmanaged,
+        })
+    }
+
     pub fn restore(
         &self,
         paths: &BTreeMap<String, String>,
@@ -261,7 +310,6 @@ impl PackagePlan {
                 &path,
                 &target_root,
                 self,
-                template_values,
                 &mut pending,
                 &mut directories,
                 &mut targets,
@@ -274,9 +322,10 @@ impl PackagePlan {
             });
         }
 
+        self.remove(template_values, RemoveMode::Safe)?;
+
         let mut report = RestoreReport::default();
         for restore in pending {
-            remove_target(&restore.target)?;
             fs::rename(&restore.backup, &restore.target).map_err(|source| {
                 PackageError::RestoreBackup {
                     backup: restore.backup.clone(),
@@ -582,7 +631,6 @@ fn scan_restore_directory(
     variable_backup_root: &Path,
     target_root: &Path,
     plan: &PackagePlan,
-    template_values: &BTreeMap<String, String>,
     pending: &mut Vec<RestoredEntry>,
     directories: &mut Vec<PathBuf>,
     targets: &mut BTreeSet<PathBuf>,
@@ -603,7 +651,6 @@ fn scan_restore_directory(
                 variable_backup_root,
                 target_root,
                 plan,
-                template_values,
                 pending,
                 directories,
                 targets,
@@ -627,21 +674,13 @@ fn scan_restore_directory(
         if !targets.insert(target.clone()) {
             return Err(PackageError::DuplicateRestoreTarget { path: target });
         }
-        let entry = plan
-            .entries
+        plan.entries
             .iter()
             .find(|entry| entry.target == target)
             .ok_or_else(|| PackageError::BackupTargetNotInPackage {
                 backup: backup.clone(),
                 target: target.clone(),
             })?;
-        let rendered = match entry.kind {
-            EntryKind::Symlink => None,
-            EntryKind::Template => Some(render_template(&entry.source, template_values)?),
-        };
-        if !target_is_current_entry(entry, rendered.as_deref())? {
-            return Err(PackageError::RestoreTargetNotManaged { path: target });
-        }
 
         pending.push(RestoredEntry { backup, target });
     }
@@ -892,8 +931,8 @@ pub enum PackageError {
     DuplicateRestoreTarget {
         path: PathBuf,
     },
-    RestoreTargetNotManaged {
-        path: PathBuf,
+    UnmanagedTargets {
+        paths: Vec<PathBuf>,
     },
     RestoreBackup {
         backup: PathBuf,
@@ -1070,10 +1109,14 @@ impl fmt::Display for PackageError {
                 "multiple backup files map to restore target {}",
                 path.display()
             ),
-            Self::RestoreTargetNotManaged { path } => write!(
+            Self::UnmanagedTargets { paths } => write!(
                 formatter,
-                "refusing to restore over a target not currently managed by dtm: {}",
-                path.display()
+                "package has targets not managed by dtm: {}",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::RestoreBackup {
                 backup,

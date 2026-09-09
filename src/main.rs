@@ -2,12 +2,12 @@ mod config;
 mod package;
 
 use config::{Config, configured_runtime_config, set_backup_dir, set_pkgs_dir};
-use package::{ApplyMode, EntryKind, PackagePlan};
+use package::{ApplyMode, EntryKind, PackagePlan, RemoveMode};
 use std::env;
 use std::error::Error;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage:\n  dtm [--config <PATH>] stow [--pkgs-dir <PATH>] [-s | --semi-force | -f | --force] [-b | --backup] [--dry-run] <PACKAGE>\n  dtm [--config <PATH>] restore <PACKAGE>\n  dtm [--config <PATH>] config set pkgs_dir <PATH>\n  dtm [--config <PATH>] config set backup_dir <PATH>\n  dtm [--config <PATH>] config get pkgs_dir\n  dtm [--config <PATH>] config get backup_dir\n  dtm [--config <PATH>] config list";
+const USAGE: &str = "Usage:\n  dtm [--config <PATH>] stow [--pkgs-dir <PATH>] [-s | --semi-force | -f | --force] [-b | --backup] [--dry-run] <PACKAGE>\n  dtm [--config <PATH>] rm [--skip-unmanaged] <PACKAGE>\n  dtm [--config <PATH>] restore <PACKAGE>\n  dtm [--config <PATH>] config set pkgs_dir <PATH>\n  dtm [--config <PATH>] config set backup_dir <PATH>\n  dtm [--config <PATH>] config get pkgs_dir\n  dtm [--config <PATH>] config get backup_dir\n  dtm [--config <PATH>] config list";
 
 fn main() {
     if let Err(error) = run() {
@@ -63,6 +63,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Command::Stow(command) => run_stow(cli.config.as_deref(), command)?,
+        Command::Remove(command) => run_remove(cli.config.as_deref(), command)?,
         Command::Restore(command) => run_restore(cli.config.as_deref(), command)?,
     }
 
@@ -124,6 +125,31 @@ fn run_stow(
     Ok(())
 }
 
+fn run_remove(
+    config_path: Option<&std::path::Path>,
+    command: RemoveCommand,
+) -> Result<(), Box<dyn Error>> {
+    let config = Config::load(config_path, None)?;
+    let template_values = config.template_values();
+    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.paths)?;
+    let mode = if command.skip_unmanaged {
+        RemoveMode::SkipUnmanaged
+    } else {
+        RemoveMode::Safe
+    };
+    let report = plan.remove(&template_values, mode)?;
+    for entry in report.removed {
+        println!("removed {}", entry.target.display());
+    }
+    for entry in report.skipped {
+        eprintln!(
+            "warning: skipped target not managed by dtm: {}",
+            entry.target.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_restore(
     config_path: Option<&std::path::Path>,
     command: RestoreCommand,
@@ -164,6 +190,7 @@ struct Cli {
 #[derive(Debug, PartialEq)]
 enum Command {
     Stow(StowCommand),
+    Remove(RemoveCommand),
     Restore(RestoreCommand),
     Config(ConfigCommand),
 }
@@ -175,6 +202,12 @@ struct StowCommand {
     mode: ApplyMode,
     backup: bool,
     dry_run: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct RemoveCommand {
+    name: String,
+    skip_unmanaged: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -212,6 +245,7 @@ impl Cli {
         let command = match command_args.first().map(String::as_str) {
             Some("config") => Some(Command::Config(parse_config_command(&command_args[1..])?)),
             Some("stow") => Some(Command::Stow(parse_stow_command(&command_args[1..])?)),
+            Some("rm") => Some(Command::Remove(parse_remove_command(&command_args[1..])?)),
             Some("restore") => Some(Command::Restore(parse_restore_command(&command_args[1..])?)),
             Some(command) => return Err(CliError::UnknownCommand(command.to_owned())),
             None => None,
@@ -238,6 +272,31 @@ fn parse_config_command(args: &[String]) -> Result<ConfigCommand, CliError> {
         }
         _ => Err(CliError::InvalidConfigCommand),
     }
+}
+
+fn parse_remove_command(args: &[String]) -> Result<RemoveCommand, CliError> {
+    let mut name = None;
+    let mut skip_unmanaged = false;
+
+    for argument in args {
+        match argument.as_str() {
+            "--skip-unmanaged" => skip_unmanaged = true,
+            _ if argument.starts_with('-') => {
+                return Err(CliError::UnknownArgument(argument.to_owned()));
+            }
+            _ => {
+                if name.is_some() {
+                    return Err(CliError::UnexpectedArgument(argument.to_owned()));
+                }
+                name = Some(argument.to_owned());
+            }
+        }
+    }
+
+    Ok(RemoveCommand {
+        name: name.ok_or(CliError::MissingPackage)?,
+        skip_unmanaged,
+    })
 }
 
 fn parse_restore_command(args: &[String]) -> Result<RestoreCommand, CliError> {

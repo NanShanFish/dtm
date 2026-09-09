@@ -74,21 +74,46 @@ reversible. If the mapped backup path already exists, stow fails instead of
 overwriting it or creating a numbered backup; restore the existing backup
 first.
 
+Remove an installed package with:
+
+```sh
+dtm rm <PACKAGE>
+```
+
+Removal is safe by default. Before deleting anything, dtm checks every entry in
+the current package plan with the same ownership test used for idempotent stow:
+a symlink must still point to its package source, and a rendered template must
+still have exactly the expected contents. A missing, modified, replaced, or
+redirected target is not managed by dtm. If any such target exists, the entire
+remove operation stops without deleting any package entry.
+
+Use `--skip-unmanaged` to leave those targets untouched and remove only entries
+that still pass the dtm ownership check:
+
+```sh
+dtm rm --skip-unmanaged <PACKAGE>
+```
+
+Removal deletes only managed files and symbolic links. It does not recursively
+delete destination directories.
+
 Restore a package backup with:
 
 ```sh
 dtm restore <PACKAGE>
 ```
 
-Restore first scans the complete package backup and validates every entry before
-changing any target. Each backup must map to an entry in the package's current
-plan. A managed symlink target must still point to that entry's package source;
-a managed template target must still be a regular file whose bytes match the
-currently rendered template. If any target is missing, modified, points
-elsewhere, or any backup entry cannot be mapped, the whole restore is rejected
-without moving any backup. After a successful preflight, dtm removes the managed
-targets, moves the backups into their original locations, and removes the now
-empty package backup directories.
+Restore first scans the complete package backup and validates that every backup
+maps to the package's current plan. It then performs the same safe, whole-package
+removal as `dtm rm`; this preflight checks every planned target, including
+installed entries that have no backup. If any target is missing, modified,
+points elsewhere, or any backup entry cannot be mapped, the whole restore is
+rejected without deleting a target or moving a backup.
+
+After both preflights succeed, dtm uninstalls the complete package, moves the
+backed-up files into their original locations, and removes the now-empty package
+backup directories. Consequently, package entries without backups remain
+uninstalled after restore; only the original conflicting files are restored.
 
 A template is rendered before the target is checked. A regular target whose
 bytes already match the rendered template is left unchanged.
@@ -101,11 +126,12 @@ $XDG_CONFIG_HOME/dtm/config.yaml
 ```
 
 When `XDG_CONFIG_HOME` is not set, it uses `~/.config/dtm/config.yaml`.
-Use the shared `--config` option before `stow`, `restore`, or `config` to
+Use the shared `--config` option before `stow`, `rm`, `restore`, or `config` to
 select a different file:
 
 ```sh
 dtm --config /path/to/config.yaml stow <PACKAGE>
+dtm --config /path/to/config.yaml rm <PACKAGE>
 dtm --config /path/to/config.yaml restore <PACKAGE>
 dtm --config /path/to/config.yaml config get pkgs_dir
 ```
@@ -126,12 +152,21 @@ configured.
 
 `config set pkgs_dir` resolves its input to an existing absolute directory.
 `config set backup_dir` resolves its input to an absolute path and creates the
-directory when needed. Package deployment options such as `--pkgs-dir`,
-`--dry-run`, backup, and force modes are accepted only by `stow`; `restore`
-uses the configured package and backup directories.
+directory when needed. Deployment options such as `--pkgs-dir`, `--dry-run`,
+backup, and force modes are accepted only by `stow`. The `--skip-unmanaged`
+option is accepted only by `rm`; `rm` and `restore` use the configured package
+directory, and `restore` also uses the configured backup directory.
 
-Configuration uses YAML with separate runtime configuration and template
-variables:
+`config.pkgs_dir` must be an absolute path. It defaults to the current working
+directory when omitted. The stow-only `--pkgs-dir` option overrides it for the
+current run without changing the configuration file:
+
+```sh
+dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>
+```
+
+Configuration uses YAML with separate runtime configuration, filesystem paths,
+and ordinary template variables:
 
 ```yaml
 config:

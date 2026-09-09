@@ -346,6 +346,99 @@ fn force_uses_a_fixed_backup_path_and_refuses_to_overwrite_it() {
 }
 
 #[test]
+fn safe_remove_preflights_all_entries_and_skip_mode_removes_only_managed_targets() {
+    let fixture = TemporaryDirectory::new("remove-managed-only");
+    let pkgs_dir = fixture.path().join("dotfiles");
+    let package = pkgs_dir.join("pkg/home");
+    let target_home = fixture.path().join("target");
+    fs::create_dir_all(&package).expect("create package");
+    fs::write(package.join("linked"), "source\n").expect("write link source");
+    fs::write(package.join("settings.tmpl"), "name={=name=}\n").expect("write template source");
+
+    let paths = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
+    let mut template_values = paths.clone();
+    template_values.insert("name".to_owned(), "dtm".to_owned());
+    let plan = PackagePlan::load(&pkgs_dir, "pkg", &paths).expect("load package");
+    plan.apply(&template_values, ApplyMode::Normal)
+        .expect("install package");
+    fs::write(target_home.join("settings"), "user changed\n").expect("modify generated target");
+
+    let error = plan
+        .remove(&template_values, RemoveMode::Safe)
+        .expect_err("safe remove must reject unmanaged target");
+    assert!(matches!(
+        error,
+        PackageError::UnmanagedTargets { paths }
+            if paths == vec![target_home.join("settings")]
+    ));
+    assert!(target_home.join("linked").is_symlink());
+    assert_eq!(
+        fs::read_to_string(target_home.join("settings")).unwrap(),
+        "user changed\n"
+    );
+
+    let report = plan
+        .remove(&template_values, RemoveMode::SkipUnmanaged)
+        .expect("remove managed targets only");
+    assert_eq!(
+        report
+            .removed
+            .iter()
+            .map(|entry| entry.target.clone())
+            .collect::<Vec<_>>(),
+        vec![target_home.join("linked")]
+    );
+    assert_eq!(
+        report
+            .skipped
+            .iter()
+            .map(|entry| entry.target.clone())
+            .collect::<Vec<_>>(),
+        vec![target_home.join("settings")]
+    );
+    assert!(!target_home.join("linked").exists());
+    assert_eq!(
+        fs::read_to_string(target_home.join("settings")).unwrap(),
+        "user changed\n"
+    );
+}
+
+#[test]
+fn restore_uninstalls_the_whole_package_before_moving_backups() {
+    let fixture = TemporaryDirectory::new("restore-removes-package");
+    let pkgs_dir = fixture.path().join("dotfiles");
+    let package = pkgs_dir.join("pkg/home");
+    let target_home = fixture.path().join("target");
+    let backup_dir = fixture.path().join("backup");
+    fs::create_dir_all(&package).expect("create package");
+    fs::create_dir_all(&target_home).expect("create target");
+    fs::write(package.join("backed"), "new backed\n").expect("write backed source");
+    fs::write(package.join("installed"), "new installed\n").expect("write installed source");
+    fs::write(target_home.join("backed"), "old backed\n").expect("write old target");
+
+    let paths = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
+    let plan = PackagePlan::load(&pkgs_dir, "pkg", &paths).expect("load package");
+    plan.apply_with_backup(&paths, &paths, ApplyMode::Force, &backup_dir)
+        .expect("install with backup");
+    assert!(target_home.join("backed").is_symlink());
+    assert!(target_home.join("installed").is_symlink());
+    assert!(backup_dir.join("pkg/home/backed").is_file());
+    assert!(!backup_dir.join("pkg/home/installed").exists());
+
+    let report = plan
+        .restore(&paths, &paths, &backup_dir)
+        .expect("restore package backup");
+
+    assert_eq!(report.restored.len(), 1);
+    assert_eq!(
+        fs::read_to_string(target_home.join("backed")).unwrap(),
+        "old backed\n"
+    );
+    assert!(!target_home.join("installed").exists());
+    assert!(!backup_dir.join("pkg").exists());
+}
+
+#[test]
 fn restore_uses_the_nearest_variable_and_reverses_hidden_path_components() {
     let fixture = TemporaryDirectory::new("restore-nearest-variable");
     let pkgs_dir = fixture.path().join("dotfiles");
@@ -434,7 +527,8 @@ fn restore_preflights_every_target_before_moving_any_backup() {
 
     assert!(matches!(
         error,
-        PackageError::RestoreTargetNotManaged { path } if path == target_home.join("two")
+        PackageError::UnmanagedTargets { paths }
+            if paths == vec![target_home.join("two")]
     ));
     assert_eq!(
         fs::read_link(target_home.join("one")).unwrap(),
