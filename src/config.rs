@@ -11,10 +11,22 @@ const CONFIG_DIRECTORY: &str = "dtm";
 const CONFIG_FILE: &str = "config.yaml";
 const ROOT_DIRECTORY: &str = "/";
 
+type Values = BTreeMap<String, String>;
+type ResolvedValues = (Values, Values);
+
 #[derive(Debug)]
 pub struct Config {
     pub config: RuntimeConfig,
-    pub variables: BTreeMap<String, String>,
+    pub paths: Values,
+    pub variables: Values,
+}
+
+impl Config {
+    pub fn template_values(&self) -> Values {
+        let mut values = self.paths.clone();
+        values.extend(self.variables.clone());
+        values
+    }
 }
 
 #[derive(Debug)]
@@ -27,6 +39,9 @@ pub struct RuntimeConfig {
 struct RawConfig {
     #[serde(default)]
     config: RawRuntimeConfig,
+
+    #[serde(default)]
+    path: BTreeMap<String, String>,
 
     #[serde(default, alias = "variable")]
     variables: BTreeMap<String, String>,
@@ -52,31 +67,25 @@ impl Config {
     }
 
     pub fn from_path(path: &Path, pkgs_dir_override: Option<&Path>) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let raw: RawConfig =
-            serde_yaml::from_str(&contents).map_err(|source| ConfigError::Parse {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let raw = load_raw_config(path)?;
         let context = EvaluationContext::from_environment()?;
         let pkgs_dir =
             resolve_pkgs_dir(raw.config.pkgs_dir.as_deref(), &context, pkgs_dir_override)?;
         let backup_dir = resolve_backup_dir(raw.config.backup_dir.as_deref())?;
-        let variables = resolve_variables(&raw.variables, &context).map_err(|source| {
-            ConfigError::Evaluate {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
+        let (paths, variables) =
+            resolve_values(&raw.path, &raw.variables, &context).map_err(|source| {
+                ConfigError::Evaluate {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
 
         Ok(Self {
             config: RuntimeConfig {
                 pkgs_dir,
                 backup_dir,
             },
+            paths,
             variables,
         })
     }
@@ -95,20 +104,29 @@ pub fn configured_runtime_config(
         Some(path) => path.to_path_buf(),
         None => default_config_path()?,
     };
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfiguredRuntimeConfig::default());
-        }
-        Err(source) => {
-            return Err(ConfigError::Read { path, source });
-        }
-    };
-    let raw: RawConfig =
-        serde_yaml::from_str(&contents).map_err(|source| ConfigError::Parse { path, source })?;
+    let raw = load_raw_config(&path)?;
     Ok(ConfiguredRuntimeConfig {
         pkgs_dir: raw.config.pkgs_dir,
         backup_dir: raw.config.backup_dir,
+    })
+}
+
+fn load_raw_config(path: &Path) -> Result<RawConfig, ConfigError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RawConfig::default());
+        }
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    serde_yaml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -380,11 +398,18 @@ fn resolve_backup_dir(configured: Option<&Path>) -> Result<Option<PathBuf>, Conf
     }
 }
 
-fn resolve_variables(
+fn resolve_values(
+    configured_paths: &BTreeMap<String, String>,
     configured_variables: &BTreeMap<String, String>,
     context: &EvaluationContext,
-) -> Result<BTreeMap<String, String>, EvaluationError> {
-    let mut variables = BTreeMap::from([
+) -> Result<ResolvedValues, EvaluationError> {
+    for name in configured_paths.keys() {
+        if configured_variables.contains_key(name) {
+            return Err(EvaluationError::DuplicateName { name: name.clone() });
+        }
+    }
+
+    let mut raw_paths = BTreeMap::from([
         (
             "home".to_owned(),
             context.home.to_string_lossy().into_owned(),
@@ -394,9 +419,53 @@ fn resolve_variables(
             context.root.to_string_lossy().into_owned(),
         ),
     ]);
-    variables.extend(configured_variables.clone());
+    raw_paths.extend(configured_paths.clone());
 
-    VariableResolver::new(&variables).resolve_all()
+    for name in configured_variables.keys() {
+        if raw_paths.contains_key(name) {
+            return Err(EvaluationError::DuplicateName { name: name.clone() });
+        }
+    }
+
+    let mut raw = raw_paths.clone();
+    raw.extend(configured_variables.clone());
+    let resolved = VariableResolver::new(&raw).resolve_all()?;
+
+    let mut paths = BTreeMap::new();
+    for name in raw_paths.keys() {
+        let value = resolved
+            .get(name)
+            .expect("the resolver returns every configured value")
+            .clone();
+        if !Path::new(&value).is_absolute() {
+            return Err(EvaluationError::RelativePath {
+                name: name.clone(),
+                value,
+            });
+        }
+        paths.insert(
+            name.clone(),
+            resolved
+                .get(name)
+                .expect("the resolver returns every configured value")
+                .clone(),
+        );
+    }
+
+    let variables = configured_variables
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                resolved
+                    .get(name)
+                    .expect("the resolver returns every configured value")
+                    .clone(),
+            )
+        })
+        .collect();
+
+    Ok((paths, variables))
 }
 
 struct VariableResolver<'a> {
@@ -682,6 +751,8 @@ impl Error for ConfigError {
 
 #[derive(Debug)]
 pub enum EvaluationError {
+    DuplicateName { name: String },
+    RelativePath { name: String, value: String },
     EmptyReference { variable: String },
     InvalidReference { variable: String, reference: String },
     UnterminatedReference { variable: String },
@@ -693,6 +764,13 @@ pub enum EvaluationError {
 impl fmt::Display for EvaluationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DuplicateName { name } => {
+                write!(formatter, "'{name}' is defined in both path and variables")
+            }
+            Self::RelativePath { name, value } => write!(
+                formatter,
+                "path '{name}' must resolve to an absolute path, got {value}"
+            ),
             Self::EmptyReference { variable } => {
                 write!(
                     formatter,

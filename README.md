@@ -54,12 +54,13 @@ otherwise delete. Normal mode still skips conflicts, so backup has no effect in
 normal mode. Backups require `config.backup_dir` and use a fixed reverse mapping:
 
 ```text
-<backup_dir>/<PACKAGE>/<NEAREST_VARIABLE>/<reverse-mapped-relative-path>
+<backup_dir>/<PACKAGE>/<NEAREST_PATH>/<reverse-mapped-relative-path>
 ```
 
-For each target, dtm selects the configured variable whose absolute path is the
-nearest parent of that target. For example, with `home=/home/user` and
-`config_home=/home/user/.config`, a conflict at
+For each target, dtm selects the configured path whose absolute value is the
+nearest parent of that target. Ordinary `variables` are never considered during
+this filesystem lookup. For example, with `home=/home/user` and
+`config_home=/home/user/.config` in the `path` block, a conflict at
 `/home/user/.config/app/settings` is backed up below
 `<backup_dir>/<PACKAGE>/config_home/app/settings`, not below
 `home/dot-config/app/settings`.
@@ -137,21 +138,31 @@ config:
   pkgs_dir: /home/user/dotfiles
   backup_dir: /home/user/.local/state/dtm/backups
 
-variables:
+path:
   config_home: ${home}/.config
   local_bin: ${home}/.local/bin
   system_config: ${root}/etc/dtm
+  themed_config: ${config_home}/${theme}
+
+variables:
+  theme: dark
+  profile: personal
 ```
 
-`config.pkgs_dir` must be an absolute path. It defaults to the current working
-directory when omitted. The `--pkgs-dir` option overrides it for the current run
-without changing the configuration file:
-
-```sh
-dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>
-```
-
+`path` contains filesystem destination roots. Every resolved path must be
+absolute. Package first-level directories must name an entry in `path`, and
+backup nearest-parent matching plus restore lookup inspect only this block.
 `home` defaults to the current user's home directory and `root` defaults to the
-filesystem root (`/`). Both are normal variables and can be overridden. A value
-may reference another declared variable, such as `${config_home}/dtm`. Unknown
-variables, malformed references, and reference cycles are rejected.
+filesystem root (`/`); both are predefined paths and may be overridden in
+`path`.
+
+`variables` contains ordinary string values and is not inspected by filesystem
+operations, even when a string happens to look like an absolute path. The two
+blocks share interpolation resolution, so a path can reference a variable and
+a variable can reference a path. Defining the same name in both blocks is an
+error because template references would be ambiguous.
+
+Templates receive the merged values from both blocks. Thus both
+`{=config_home=}` and `{=theme=}` are valid. Unknown references, malformed
+references, relative values in `path`, and cycles across either block are
+rejected.

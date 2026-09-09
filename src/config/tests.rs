@@ -10,45 +10,54 @@ fn context() -> EvaluationContext {
 }
 
 #[test]
-fn resolves_builtins_and_variable_references() {
+fn resolves_path_and_variable_references_across_blocks() {
     let raw: RawConfig = serde_yaml::from_str(
         r#"
 config:
   pkgs_dir: /repos/dotfiles
-variables:
+path:
   config_home: ${home}/.config
   local_bin: ${home}/.local/bin
   dtm_config: ${config_home}/dtm
+  themed_config: ${config_home}/${theme}
   system_config: ${root}/etc/dtm
+variables:
+  theme: dark
+  config_label: ${config_home}/label
 unknown:
   ignored: true
 "#,
     )
     .expect("valid config");
 
-    let variables = resolve_variables(&raw.variables, &context()).expect("resolve variables");
+    let (paths, variables) =
+        resolve_values(&raw.path, &raw.variables, &context()).expect("resolve values");
 
     assert_eq!(raw.config.pkgs_dir, Some(PathBuf::from("/repos/dotfiles")));
-    assert_eq!(variables["home"], "/home/tester");
-    assert_eq!(variables["root"], "/");
-    assert!(!variables.contains_key("_pkgs_dir"));
-    assert_eq!(variables["config_home"], "/home/tester/.config");
-    assert_eq!(variables["local_bin"], "/home/tester/.local/bin");
-    assert_eq!(variables["dtm_config"], "/home/tester/.config/dtm");
-    assert_eq!(variables["system_config"], "/etc/dtm");
+    assert_eq!(paths["home"], "/home/tester");
+    assert_eq!(paths["root"], "/");
+    assert_eq!(paths["config_home"], "/home/tester/.config");
+    assert_eq!(paths["local_bin"], "/home/tester/.local/bin");
+    assert_eq!(paths["dtm_config"], "/home/tester/.config/dtm");
+    assert_eq!(paths["themed_config"], "/home/tester/.config/dark");
+    assert_eq!(paths["system_config"], "/etc/dtm");
+    assert_eq!(variables["theme"], "dark");
+    assert_eq!(variables["config_label"], "/home/tester/.config/label");
 }
 
 #[test]
-fn configured_values_override_predefined_variables() {
-    let variables = BTreeMap::from([
+fn configured_paths_override_predefined_paths() {
+    let paths = BTreeMap::from([
         ("home".to_owned(), "/custom/home".to_owned()),
         ("root".to_owned(), "/custom/root".to_owned()),
         ("config_home".to_owned(), "${home}/.config".to_owned()),
         ("system_config".to_owned(), "${root}/etc/dtm".to_owned()),
     ]);
 
-    let resolved = resolve_variables(&variables, &context()).expect("resolve variables");
+    let (resolved, variables) =
+        resolve_values(&paths, &BTreeMap::new(), &context()).expect("resolve paths");
 
+    assert!(variables.is_empty());
     assert_eq!(resolved["home"], "/custom/home");
     assert_eq!(resolved["root"], "/custom/root");
     assert_eq!(resolved["config_home"], "/custom/home/.config");
@@ -101,8 +110,9 @@ fn configured_backup_directory_must_be_absolute() {
 
 #[test]
 fn rejects_unknown_references() {
-    let variables = BTreeMap::from([("config_home".to_owned(), "${missing}/dtm".to_owned())]);
-    let error = resolve_variables(&variables, &context()).expect_err("unknown reference");
+    let paths = BTreeMap::from([("config_home".to_owned(), "${missing}/dtm".to_owned())]);
+    let error =
+        resolve_values(&paths, &BTreeMap::new(), &context()).expect_err("unknown reference");
 
     assert!(matches!(
         error,
@@ -111,22 +121,36 @@ fn rejects_unknown_references() {
 }
 
 #[test]
-fn rejects_cyclic_references() {
-    let variables = BTreeMap::from([
-        ("a".to_owned(), "${b}".to_owned()),
-        ("b".to_owned(), "${a}".to_owned()),
-    ]);
-    let error = resolve_variables(&variables, &context()).expect_err("cycle");
+fn rejects_cyclic_references_across_blocks() {
+    let paths = BTreeMap::from([("a".to_owned(), "${b}".to_owned())]);
+    let variables = BTreeMap::from([("b".to_owned(), "${a}".to_owned())]);
+    let error = resolve_values(&paths, &variables, &context()).expect_err("cycle");
 
     assert!(matches!(error, EvaluationError::Cycle { .. }));
 }
 
 #[test]
-fn loads_configured_pkgs_directory() {
+fn rejects_duplicate_names_and_relative_paths() {
+    let paths = BTreeMap::from([("theme".to_owned(), "/theme".to_owned())]);
+    let variables = BTreeMap::from([("theme".to_owned(), "dark".to_owned())]);
+    assert!(matches!(
+        resolve_values(&paths, &variables, &context()),
+        Err(EvaluationError::DuplicateName { name }) if name == "theme"
+    ));
+
+    let paths = BTreeMap::from([("cache".to_owned(), "relative/cache".to_owned())]);
+    assert!(matches!(
+        resolve_values(&paths, &BTreeMap::new(), &context()),
+        Err(EvaluationError::RelativePath { name, .. }) if name == "cache"
+    ));
+}
+
+#[test]
+fn loaded_config_separates_paths_and_template_variables() {
     let path = temporary_path("configured-dot-dir");
     fs::write(
         &path,
-        "config:\n  pkgs_dir: /configured/dotfiles\nvariables:\n  config_home: /tmp/config\n",
+        "config:\n  pkgs_dir: /configured/dotfiles\npath:\n  config_home: ${home}/.config\nvariables:\n  theme: dark\n",
     )
     .expect("write fixture");
 
@@ -136,10 +160,16 @@ fn loads_configured_pkgs_directory() {
         config.config.pkgs_dir,
         PathBuf::from("/configured/dotfiles")
     );
-    assert_eq!(config.variables["home"], fixture_home());
-    assert_eq!(config.variables["root"], "/");
-    assert!(!config.variables.contains_key("_pkgs_dir"));
-    assert_eq!(config.variables["config_home"], "/tmp/config");
+    assert_eq!(config.paths["home"], fixture_home());
+    assert_eq!(config.paths["root"], "/");
+    assert_eq!(
+        config.paths["config_home"],
+        format!("{}/.config", fixture_home())
+    );
+    assert_eq!(config.variables["theme"], "dark");
+    let template_values = config.template_values();
+    assert_eq!(template_values["config_home"], config.paths["config_home"]);
+    assert_eq!(template_values["theme"], "dark");
     let _ = fs::remove_file(path);
 }
 
@@ -166,17 +196,62 @@ fn command_line_pkgs_directory_overrides_config() {
 }
 
 #[test]
-fn configured_pkgs_directory_is_absent_when_not_in_file() {
-    let path = temporary_path("list-without-pkgs-dir");
-    fs::write(&path, "variables:\n  home_name: tester\n").expect("write fixture");
+fn configured_runtime_config_returns_only_explicit_values() {
+    let path = temporary_path("configured-runtime-only");
+    fs::write(
+        &path,
+        "path:\n  config_home: /tmp/config\nvariables:\n  theme: dark\n",
+    )
+    .expect("write config");
+
+    let configured = configured_runtime_config(Some(&path)).expect("read configured runtime");
+    assert_eq!(configured, ConfiguredRuntimeConfig::default());
+
+    let loaded = Config::load(Some(&path), None).expect("load defaults");
+    assert_eq!(loaded.config.pkgs_dir, env::current_dir().unwrap());
+    assert_eq!(loaded.config.backup_dir, None);
+    assert_eq!(loaded.paths["config_home"], "/tmp/config");
+    assert_eq!(loaded.variables["theme"], "dark");
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn configured_runtime_config_preserves_explicit_values_without_loading_defaults() {
+    let path = temporary_path("configured-runtime-values");
+    fs::write(
+        &path,
+        "config:\n  pkgs_dir: relative/packages\n  backup_dir: relative/backups\n",
+    )
+    .expect("write config");
+
+    let configured = configured_runtime_config(Some(&path)).expect("read configured runtime");
+    assert_eq!(
+        configured.pkgs_dir,
+        Some(PathBuf::from("relative/packages"))
+    );
+    assert_eq!(
+        configured.backup_dir,
+        Some(PathBuf::from("relative/backups"))
+    );
+
+    let error = Config::load(Some(&path), None).expect_err("relative runtime paths");
+    assert!(matches!(error, ConfigError::RelativePkgsDirectory { .. }));
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn both_loaders_treat_a_missing_file_as_no_explicit_configuration() {
+    let path = temporary_path("missing-runtime-config");
 
     assert_eq!(
-        configured_runtime_config(Some(&path))
-            .expect("read config")
-            .pkgs_dir,
-        None
+        configured_runtime_config(Some(&path)).expect("read missing config"),
+        ConfiguredRuntimeConfig::default()
     );
-    let _ = fs::remove_file(path);
+    let loaded = Config::load(Some(&path), None).expect("load defaults from missing config");
+    assert_eq!(loaded.config.pkgs_dir, env::current_dir().unwrap());
+    assert_eq!(loaded.config.backup_dir, None);
 }
 
 #[test]
@@ -186,15 +261,15 @@ fn set_pkgs_directory_preserves_yaml_layout_and_comments() {
     let pkgs_dir = fixture.join("packages");
     fs::create_dir_all(&pkgs_dir).expect("create packages directory");
     let path = fixture.join("config.yaml");
-    let original = "# Keep this header.\nvariables:\n  config_home: /tmp/config\n\n# Keep variables above config.\nconfig:\n  # Existing package directory.\n  old: value\n\n# Keep this trailing comment.\n";
+    let original = "# Keep this header.\npath:\n  config_home: /tmp/config\n\n# Keep path above config.\nconfig:\n  # Existing package directory.\n  old: value\n\n# Keep this trailing comment.\n";
     fs::write(&path, original).expect("write config");
 
     set_pkgs_dir(Some(&path), &pkgs_dir).expect("set packages directory");
     let updated = fs::read_to_string(&path).expect("read updated config");
 
-    assert!(updated.starts_with("# Keep this header.\nvariables:\n"));
-    assert!(updated.find("variables:").unwrap() < updated.find("config:").unwrap());
-    assert!(updated.contains("# Keep variables above config.\n"));
+    assert!(updated.starts_with("# Keep this header.\npath:\n"));
+    assert!(updated.find("path:").unwrap() < updated.find("config:").unwrap());
+    assert!(updated.contains("# Keep path above config.\n"));
     assert!(updated.contains("  # Existing package directory.\n"));
     assert!(updated.contains(&format!(
         "  pkgs_dir: {}\n\n# Keep this trailing comment.\n",
@@ -223,7 +298,7 @@ fn set_pkgs_directory_creates_and_updates_config() {
     fs::write(
         &config_path,
         format!(
-            "config:\n  pkgs_dir: {}\nvariables:\n  config_home: /tmp/config\n",
+            "config:\n  pkgs_dir: {}\npath:\n  config_home: /tmp/config\n",
             first_pkgs_dir.canonicalize().unwrap().display()
         ),
     )
@@ -235,9 +310,7 @@ fn set_pkgs_directory_creates_and_updates_config() {
         config.config.pkgs_dir,
         second_pkgs_dir.canonicalize().unwrap()
     );
-    assert_eq!(config.variables["config_home"], "/tmp/config");
-
-    let _ = fs::remove_dir_all(fixture);
+    assert_eq!(config.paths["config_home"], "/tmp/config");
 }
 
 #[test]
@@ -247,7 +320,7 @@ fn set_backup_directory_preserves_existing_config_layout() {
     let backup_dir = fixture.join("backup");
     let config_path = fixture.join("config.yaml");
     let original =
-        "variables:\n  config_home: /tmp/config\n\nconfig:\n  pkgs_dir: /repos/dotfiles # keep\n";
+        "path:\n  config_home: /tmp/config\n\nconfig:\n  pkgs_dir: /repos/dotfiles # keep\n";
     fs::write(&config_path, original).expect("write config");
 
     let (_, configured_backup) =
@@ -258,7 +331,7 @@ fn set_backup_directory_preserves_existing_config_layout() {
     assert_eq!(configured_backup, backup_dir.canonicalize().unwrap());
     assert_eq!(configured.backup_dir, Some(configured_backup.clone()));
     assert_eq!(configured.pkgs_dir, Some(PathBuf::from("/repos/dotfiles")));
-    assert!(updated.starts_with("variables:\n  config_home: /tmp/config\n\nconfig:\n"));
+    assert!(updated.starts_with("path:\n  config_home: /tmp/config\n\nconfig:\n"));
     assert!(updated.contains("  pkgs_dir: /repos/dotfiles # keep\n"));
     assert!(updated.contains(&format!("  backup_dir: {}\n", configured_backup.display())));
 

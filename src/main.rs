@@ -74,7 +74,8 @@ fn run_stow(
     command: StowCommand,
 ) -> Result<(), Box<dyn Error>> {
     let config = Config::load(config_path, command.pkgs_dir.as_deref())?;
-    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.variables)?;
+    let template_values = config.template_values();
+    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.paths)?;
     let backup_dir = if command.backup && command.mode != ApplyMode::Normal {
         Some(
             config
@@ -101,9 +102,9 @@ fn run_stow(
 
     let report = match backup_dir {
         Some(backup_dir) => {
-            plan.apply_with_backup(&config.variables, command.mode, Some(backup_dir))?
+            plan.apply_with_backup(&config.paths, &template_values, command.mode, backup_dir)?
         }
-        None => plan.apply(&config.variables, command.mode)?,
+        None => plan.apply(&template_values, command.mode)?,
     };
     for backup in report.backups {
         eprintln!(
@@ -133,8 +134,9 @@ fn run_restore(
         .backup_dir
         .as_deref()
         .ok_or(CliError::BackupDirectoryNotConfigured)?;
-    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.variables)?;
-    let report = plan.restore(&config.variables, backup_dir)?;
+    let template_values = config.template_values();
+    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.paths)?;
+    let report = plan.restore(&config.paths, &template_values, backup_dir)?;
     for restored in report.restored {
         println!(
             "restored {} -> {}",

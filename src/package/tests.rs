@@ -248,7 +248,7 @@ fn normal_mode_does_not_backup_a_target_it_would_skip() {
     let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
     let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
     let report = plan
-        .apply_with_backup(&variables, ApplyMode::Normal, Some(&backup_dir))
+        .apply_with_backup(&variables, &variables, ApplyMode::Normal, &backup_dir)
         .expect("normal apply");
 
     assert_eq!(report.applied.len(), 0);
@@ -280,7 +280,7 @@ fn semi_force_backs_up_a_conflicting_link_using_reverse_mapping() {
     let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
     let plan = PackagePlan::load(&pkgs_dir, "git", &variables).expect("load package");
     let report = plan
-        .apply_with_backup(&variables, ApplyMode::SemiForce, Some(&backup_dir))
+        .apply_with_backup(&variables, &variables, ApplyMode::SemiForce, &backup_dir)
         .expect("semi-force apply");
     let expected_backup = backup_dir.join("git/home/dot-gitconfig");
 
@@ -294,7 +294,7 @@ fn semi_force_backs_up_a_conflicting_link_using_reverse_mapping() {
     );
 
     let restored = plan
-        .restore(&variables, &backup_dir)
+        .restore(&variables, &variables, &backup_dir)
         .expect("restore old link");
     assert_eq!(restored.restored.len(), 1);
     assert_eq!(
@@ -319,14 +319,14 @@ fn force_uses_a_fixed_backup_path_and_refuses_to_overwrite_it() {
     let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
     let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
     let first = plan
-        .apply_with_backup(&variables, ApplyMode::Force, Some(&backup_dir))
+        .apply_with_backup(&variables, &variables, ApplyMode::Force, &backup_dir)
         .expect("first force apply");
     let backup = backup_dir.join("pkg/home/dot-config");
     assert_eq!(first.backups[0].backup, backup);
     assert_eq!(fs::read_to_string(&backup).unwrap(), "first\n");
 
     let unchanged = plan
-        .apply_with_backup(&variables, ApplyMode::Force, Some(&backup_dir))
+        .apply_with_backup(&variables, &variables, ApplyMode::Force, &backup_dir)
         .expect("idempotent force apply");
     assert_eq!(unchanged.backups.len(), 0);
     assert_eq!(unchanged.skipped[0].reason, "already up to date");
@@ -334,7 +334,7 @@ fn force_uses_a_fixed_backup_path_and_refuses_to_overwrite_it() {
     fs::remove_file(target_home.join(".config")).expect("remove deployed link");
     fs::write(target_home.join(".config"), "second\n").expect("write second target");
     let error = plan
-        .apply_with_backup(&variables, ApplyMode::Force, Some(&backup_dir))
+        .apply_with_backup(&variables, &variables, ApplyMode::Force, &backup_dir)
         .expect_err("existing backup must not be overwritten");
 
     assert!(matches!(error, PackageError::BackupAlreadyExists { path } if path == backup));
@@ -360,20 +360,21 @@ fn restore_uses_the_nearest_variable_and_reverses_hidden_path_components() {
         .expect("write symlink source");
     fs::write(
         package.join("config_home/app/settings.tmpl"),
-        "name={=name=}\n",
+        "config={=config_home=}\n",
     )
     .expect("write template source");
     fs::write(config_home.join("app/.state"), "old state\n").expect("write old state");
     fs::write(config_home.join("app/settings"), "old settings\n").expect("write old settings");
 
-    let variables = BTreeMap::from([
+    let paths = BTreeMap::from([
         ("home".to_owned(), target_home.display().to_string()),
         ("config_home".to_owned(), config_home.display().to_string()),
-        ("name".to_owned(), "dtm".to_owned()),
     ]);
-    let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
+    let mut template_values = paths.clone();
+    template_values.insert("name".to_owned(), "dtm".to_owned());
+    let plan = PackagePlan::load(&pkgs_dir, "pkg", &paths).expect("load package");
     let applied = plan
-        .apply_with_backup(&variables, ApplyMode::Force, Some(&backup_dir))
+        .apply_with_backup(&paths, &template_values, ApplyMode::Force, &backup_dir)
         .expect("stow with backup");
 
     let state_backup = backup_dir.join("pkg/config_home/app/dot-state");
@@ -388,11 +389,11 @@ fn restore_uses_the_nearest_variable_and_reverses_hidden_path_components() {
     );
     assert_eq!(
         fs::read_to_string(config_home.join("app/settings")).unwrap(),
-        "name=dtm\n"
+        format!("config={}\n", config_home.display())
     );
 
     let restored = plan
-        .restore(&variables, &backup_dir)
+        .restore(&paths, &template_values, &backup_dir)
         .expect("restore package");
     assert_eq!(restored.restored.len(), 2);
     assert_eq!(
@@ -422,13 +423,13 @@ fn restore_preflights_every_target_before_moving_any_backup() {
 
     let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
     let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
-    plan.apply_with_backup(&variables, ApplyMode::Force, Some(&backup_dir))
+    plan.apply_with_backup(&variables, &variables, ApplyMode::Force, &backup_dir)
         .expect("stow with backup");
 
     fs::remove_file(target_home.join("two")).expect("remove managed target");
     fs::write(target_home.join("two"), "user changed\n").expect("replace managed target");
     let error = plan
-        .restore(&variables, &backup_dir)
+        .restore(&variables, &variables, &backup_dir)
         .expect_err("changed target must block restore");
 
     assert!(matches!(
@@ -468,7 +469,7 @@ fn semi_force_does_not_backup_a_regular_file() {
     let variables = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
     let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
     let report = plan
-        .apply_with_backup(&variables, ApplyMode::SemiForce, Some(&backup_dir))
+        .apply_with_backup(&variables, &variables, ApplyMode::SemiForce, &backup_dir)
         .expect("semi-force apply");
 
     assert_eq!(report.applied.len(), 0);
@@ -486,28 +487,27 @@ fn template_compares_rendered_content_and_force_replaces_different_file() {
     fs::create_dir_all(&package).expect("create package");
     fs::write(package.join("settings.tmpl"), "name={=name=}\n").expect("write template");
 
-    let variables = BTreeMap::from([
-        ("home".to_owned(), target_home.display().to_string()),
-        ("name".to_owned(), "dtm".to_owned()),
-    ]);
-    let plan = PackagePlan::load(&pkgs_dir, "pkg", &variables).expect("load package");
-    plan.apply(&variables, ApplyMode::Normal)
+    let paths = BTreeMap::from([("home".to_owned(), target_home.display().to_string())]);
+    let mut template_values = paths.clone();
+    template_values.insert("name".to_owned(), "dtm".to_owned());
+    let plan = PackagePlan::load(&pkgs_dir, "pkg", &paths).expect("load package");
+    plan.apply(&template_values, ApplyMode::Normal)
         .expect("first apply");
 
     let report = plan
-        .apply(&variables, ApplyMode::Normal)
+        .apply(&template_values, ApplyMode::Normal)
         .expect("second apply");
     assert_eq!(report.applied.len(), 0);
     assert_eq!(report.skipped[0].reason, "already up to date");
 
     fs::write(target_home.join("settings"), "changed\n").expect("change generated file");
     let report = plan
-        .apply(&variables, ApplyMode::Normal)
+        .apply(&template_values, ApplyMode::Normal)
         .expect("normal apply");
     assert_eq!(report.skipped[0].reason, "target already exists");
 
     let report = plan
-        .apply(&variables, ApplyMode::Force)
+        .apply(&template_values, ApplyMode::Force)
         .expect("force apply");
     assert_eq!(report.applied.len(), 1);
     assert_eq!(

@@ -68,7 +68,7 @@ impl PackagePlan {
     pub fn load(
         pkgs_dir: &Path,
         package_name: &str,
-        variables: &BTreeMap<String, String>,
+        paths: &BTreeMap<String, String>,
     ) -> Result<Self, PackageError> {
         validate_package_name(package_name)?;
 
@@ -117,7 +117,7 @@ impl PackagePlan {
             }
 
             let variable_name = file_name.to_string();
-            let destination_root = variables
+            let destination_root = paths
                 .get(file_name.as_ref())
                 .map(PathBuf::from)
                 .ok_or_else(|| PackageError::UnknownVariableDirectory {
@@ -146,25 +146,39 @@ impl PackagePlan {
 
     pub fn apply(
         &self,
-        variables: &BTreeMap<String, String>,
+        template_values: &BTreeMap<String, String>,
         mode: ApplyMode,
     ) -> Result<ApplyReport, PackageError> {
-        self.apply_with_backup(variables, mode, None)
+        let mut report = ApplyReport::default();
+        for entry in &self.entries {
+            match apply_entry(entry, template_values, mode, None)? {
+                EntryAction::Applied(backup) => {
+                    report.applied.push(entry.clone());
+                    if let Some(backup) = backup {
+                        report.backups.push(backup);
+                    }
+                }
+                EntryAction::Skipped(reason) => report.skipped.push(SkippedEntry {
+                    entry: entry.clone(),
+                    reason,
+                }),
+            }
+        }
+        Ok(report)
     }
 
     pub fn apply_with_backup(
         &self,
-        variables: &BTreeMap<String, String>,
+        paths: &BTreeMap<String, String>,
+        template_values: &BTreeMap<String, String>,
         mode: ApplyMode,
-        backup_dir: Option<&Path>,
+        backup_dir: &Path,
     ) -> Result<ApplyReport, PackageError> {
         let mut report = ApplyReport::default();
 
         for entry in &self.entries {
-            let backup_path = backup_dir
-                .map(|backup_dir| self.backup_path(entry, variables, backup_dir))
-                .transpose()?;
-            match apply_entry(entry, variables, mode, backup_path.as_deref())? {
+            let backup_path = self.backup_path(entry, paths, backup_dir)?;
+            match apply_entry(entry, template_values, mode, Some(&backup_path))? {
                 EntryAction::Applied(backup) => {
                     report.applied.push(entry.clone());
                     if let Some(backup) = backup {
@@ -183,7 +197,8 @@ impl PackagePlan {
 
     pub fn restore(
         &self,
-        variables: &BTreeMap<String, String>,
+        paths: &BTreeMap<String, String>,
+        template_values: &BTreeMap<String, String>,
         backup_dir: &Path,
     ) -> Result<RestoreReport, PackageError> {
         let package_backup = backup_dir.join(&self.name);
@@ -227,7 +242,7 @@ impl PackagePlan {
                 .file_name()
                 .into_string()
                 .map_err(|_| PackageError::InvalidBackupEntry { path: path.clone() })?;
-            let target_root = variables.get(&variable).map(PathBuf::from).ok_or_else(|| {
+            let target_root = paths.get(&variable).map(PathBuf::from).ok_or_else(|| {
                 PackageError::UnknownBackupVariable {
                     path: path.clone(),
                     variable: variable.clone(),
@@ -246,7 +261,7 @@ impl PackagePlan {
                 &path,
                 &target_root,
                 self,
-                variables,
+                template_values,
                 &mut pending,
                 &mut directories,
                 &mut targets,
@@ -287,12 +302,14 @@ impl PackagePlan {
     fn backup_path(
         &self,
         entry: &PackageEntry,
-        variables: &BTreeMap<String, String>,
+        paths: &BTreeMap<String, String>,
         backup_dir: &Path,
     ) -> Result<PathBuf, PackageError> {
-        let (variable, target_relative) = nearest_variable_target(&entry.target, variables)
-            .ok_or_else(|| PackageError::InvalidBackupTarget {
-                path: entry.target.clone(),
+        let (variable, target_relative) =
+            nearest_path_target(&entry.target, paths).ok_or_else(|| {
+                PackageError::InvalidBackupTarget {
+                    path: entry.target.clone(),
+                }
             })?;
 
         Ok(backup_dir
@@ -310,13 +327,13 @@ enum EntryAction {
 
 fn apply_entry(
     entry: &PackageEntry,
-    variables: &BTreeMap<String, String>,
+    template_values: &BTreeMap<String, String>,
     mode: ApplyMode,
     backup_dir: Option<&Path>,
 ) -> Result<EntryAction, PackageError> {
     let rendered = match entry.kind {
         EntryKind::Symlink => None,
-        EntryKind::Template => Some(render_template(&entry.source, variables)?),
+        EntryKind::Template => Some(render_template(&entry.source, template_values)?),
     };
 
     let target_metadata = match fs::symlink_metadata(&entry.target) {
@@ -477,11 +494,11 @@ fn create_symlink(_source: &Path, _target: &Path) -> Result<(), PackageError> {
     Err(PackageError::UnsupportedPlatform)
 }
 
-fn nearest_variable_target<'a>(
+fn nearest_path_target<'a>(
     target: &Path,
-    variables: &'a BTreeMap<String, String>,
+    paths: &'a BTreeMap<String, String>,
 ) -> Option<(&'a str, PathBuf)> {
-    variables
+    paths
         .iter()
         .filter_map(|(name, value)| {
             let root = Path::new(value);
@@ -565,7 +582,7 @@ fn scan_restore_directory(
     variable_backup_root: &Path,
     target_root: &Path,
     plan: &PackagePlan,
-    variables: &BTreeMap<String, String>,
+    template_values: &BTreeMap<String, String>,
     pending: &mut Vec<RestoredEntry>,
     directories: &mut Vec<PathBuf>,
     targets: &mut BTreeSet<PathBuf>,
@@ -586,7 +603,7 @@ fn scan_restore_directory(
                 variable_backup_root,
                 target_root,
                 plan,
-                variables,
+                template_values,
                 pending,
                 directories,
                 targets,
@@ -620,7 +637,7 @@ fn scan_restore_directory(
             })?;
         let rendered = match entry.kind {
             EntryKind::Symlink => None,
-            EntryKind::Template => Some(render_template(&entry.source, variables)?),
+            EntryKind::Template => Some(render_template(&entry.source, template_values)?),
         };
         if !target_is_current_entry(entry, rendered.as_deref())? {
             return Err(PackageError::RestoreTargetNotManaged { path: target });
@@ -736,7 +753,7 @@ fn ensure_unique_targets(entries: &[PackageEntry]) -> Result<(), PackageError> {
 
 pub fn render_template(
     source: &Path,
-    variables: &BTreeMap<String, String>,
+    template_values: &BTreeMap<String, String>,
 ) -> Result<String, PackageError> {
     let contents = fs::read_to_string(source).map_err(|source_error| PackageError::ReadFile {
         path: source.to_path_buf(),
@@ -760,7 +777,7 @@ pub fn render_template(
         } else {
             let name = name.trim();
             let value =
-                variables
+                template_values
                     .get(name)
                     .ok_or_else(|| PackageError::UnknownTemplateVariable {
                         path: source.to_path_buf(),
@@ -927,17 +944,17 @@ impl fmt::Display for PackageError {
             ),
             Self::UnexpectedRootEntry { path } => write!(
                 formatter,
-                "package root only allows variable directories and {METADATA_DIRECTORY}: {}",
+                "package root only allows path directories and {METADATA_DIRECTORY}: {}",
                 path.display()
             ),
             Self::UnknownVariableDirectory { path, variable } => write!(
                 formatter,
-                "package directory {} references unknown variable '{variable}'",
+                "package directory {} references unknown path '{variable}'",
                 path.display()
             ),
             Self::RelativeVariablePath { variable, value } => write!(
                 formatter,
-                "variable '{variable}' must resolve to an absolute path, got {}",
+                "path '{variable}' must resolve to an absolute path, got {}",
                 value.display()
             ),
             Self::SymbolicLink { path } => write!(
@@ -1039,7 +1056,7 @@ impl fmt::Display for PackageError {
             ),
             Self::UnknownBackupVariable { path, variable } => write!(
                 formatter,
-                "backup directory {} references unknown variable '{variable}'",
+                "backup directory {} references unknown path '{variable}'",
                 path.display()
             ),
             Self::BackupTargetNotInPackage { backup, target } => write!(
