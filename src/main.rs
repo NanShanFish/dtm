@@ -1,13 +1,29 @@
 mod config;
+mod interactive;
+mod pack;
 mod package;
 
 use config::{Config, configured_runtime_config, set_backup_dir, set_pkgs_dir};
+use interactive::select_files;
+use pack::{PackEntry, PackPlan};
 use package::{ApplyMode, EntryKind, PackagePlan, RemoveMode};
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage:\n  dtm [--config <PATH>] stow [--pkgs-dir <PATH>] [-s | --semi-force | -f | --force] [-b | --backup] [--dry-run] <PACKAGE>\n  dtm [--config <PATH>] rm [--skip-unmanaged] <PACKAGE>\n  dtm [--config <PATH>] restore <PACKAGE>\n  dtm [--config <PATH>] config set pkgs_dir <PATH>\n  dtm [--config <PATH>] config set backup_dir <PATH>\n  dtm [--config <PATH>] config get pkgs_dir\n  dtm [--config <PATH>] config get backup_dir\n  dtm [--config <PATH>] config list";
+const USAGE: &str =
+"Usage:
+    dtm [--config <PATH>] stow [--pkgs-dir <PATH>] [-s | --semi-force | -f | --force] [-b | --backup] [--dry-run] <PACKAGE>
+    dtm [--config <PATH>] pack [-i | --interactive] <PACKAGE> <PATH>...
+    dtm [--config <PATH>] rm [--skip-unmanaged] <PACKAGE>
+    dtm [--config <PATH>] restore <PACKAGE>
+    dtm [--config <PATH>] config set pkgs_dir <PATH>
+    dtm [--config <PATH>] config set backup_dir <PATH>
+    dtm [--config <PATH>] config get pkgs_dir
+    dtm [--config <PATH>] config get backup_dir
+    dtm [--config <PATH>] config list";
 
 fn main() {
     if let Err(error) = run() {
@@ -63,6 +79,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Command::Stow(command) => run_stow(cli.config.as_deref(), command)?,
+        Command::Pack(command) => run_pack(cli.config.as_deref(), command)?,
         Command::Remove(command) => run_remove(cli.config.as_deref(), command)?,
         Command::Restore(command) => run_restore(cli.config.as_deref(), command)?,
     }
@@ -123,6 +140,94 @@ fn run_stow(
         );
     }
     Ok(())
+}
+
+fn run_pack(
+    config_path: Option<&std::path::Path>,
+    command: PackCommand,
+) -> Result<(), Box<dyn Error>> {
+    let config = Config::load(config_path, None)?;
+    let inputs = if command.interactive {
+        select_files(&command.inputs[0], &config.config.pkgs_dir)?
+    } else {
+        command.inputs
+    };
+    let plan = PackPlan::load(
+        &config.config.pkgs_dir,
+        &command.name,
+        &inputs,
+        &config.paths,
+    )?;
+    let plan = confirm_package_conflicts(plan)?;
+    if plan.entries.is_empty() {
+        return Ok(());
+    }
+    let report = plan.execute(&config.paths, &config.template_values())?;
+    for entry in report.packed {
+        println!(
+            "packed {} -> {}",
+            entry.source.display(),
+            entry.package_path.display(),
+        );
+    }
+    for skipped in report.skipped {
+        eprintln!(
+            "warning: skipped {} -> {}: {}",
+            skipped.entry.source.display(),
+            skipped.entry.target.display(),
+            skipped.reason
+        );
+    }
+    Ok(())
+}
+
+fn confirm_package_conflicts(plan: PackPlan) -> Result<PackPlan, Box<dyn Error>> {
+    let mut decisions = BTreeMap::new();
+    for entry in plan.entries.iter().filter(|entry| entry.conflicts) {
+        decisions.insert(entry.package_path.clone(), confirm_package_conflict(entry)?);
+    }
+    Ok(plan.retain(|entry| {
+        !entry.conflicts || decisions.get(&entry.package_path).copied().unwrap_or(false)
+    }))
+}
+
+fn confirm_package_conflict(entry: &PackEntry) -> Result<bool, CliError> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    confirm_package_conflict_with(entry, &mut stdin.lock(), &mut stdout.lock())
+}
+
+fn confirm_package_conflict_with(
+    entry: &PackEntry,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+) -> Result<bool, CliError> {
+    loop {
+        write!(
+            writer,
+            "replace existing package file {} with {}? [y/n] ",
+            entry.package_path.display(),
+            entry.source.display()
+        )
+        .map_err(|error| CliError::PromptIo(error.to_string()))?;
+        writer
+            .flush()
+            .map_err(|error| CliError::PromptIo(error.to_string()))?;
+        let mut answer = String::new();
+        if reader
+            .read_line(&mut answer)
+            .map_err(|error| CliError::PromptIo(error.to_string()))?
+            == 0
+        {
+            return Err(CliError::PromptClosed);
+        }
+        match answer.trim() {
+            "y" | "Y" => return Ok(true),
+            "n" | "N" => return Ok(false),
+            _ => writeln!(writer, "please answer y or n")
+                .map_err(|error| CliError::PromptIo(error.to_string()))?,
+        }
+    }
 }
 
 fn run_remove(
@@ -190,6 +295,7 @@ struct Cli {
 #[derive(Debug, PartialEq)]
 enum Command {
     Stow(StowCommand),
+    Pack(PackCommand),
     Remove(RemoveCommand),
     Restore(RestoreCommand),
     Config(ConfigCommand),
@@ -202,6 +308,13 @@ struct StowCommand {
     mode: ApplyMode,
     backup: bool,
     dry_run: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct PackCommand {
+    name: String,
+    inputs: Vec<PathBuf>,
+    interactive: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -245,6 +358,7 @@ impl Cli {
         let command = match command_args.first().map(String::as_str) {
             Some("config") => Some(Command::Config(parse_config_command(&command_args[1..])?)),
             Some("stow") => Some(Command::Stow(parse_stow_command(&command_args[1..])?)),
+            Some("pack") => Some(Command::Pack(parse_pack_command(&command_args[1..])?)),
             Some("rm") => Some(Command::Remove(parse_remove_command(&command_args[1..])?)),
             Some("restore") => Some(Command::Restore(parse_restore_command(&command_args[1..])?)),
             Some(command) => return Err(CliError::UnknownCommand(command.to_owned())),
@@ -272,6 +386,34 @@ fn parse_config_command(args: &[String]) -> Result<ConfigCommand, CliError> {
         }
         _ => Err(CliError::InvalidConfigCommand),
     }
+}
+
+fn parse_pack_command(args: &[String]) -> Result<PackCommand, CliError> {
+    let mut positional = Vec::new();
+    let mut interactive = false;
+    for argument in args {
+        match argument.as_str() {
+            "-i" | "--interactive" => interactive = true,
+            _ if argument.starts_with('-') => {
+                return Err(CliError::UnknownArgument(argument.to_owned()));
+            }
+            _ => positional.push(argument),
+        }
+    }
+    let Some((name, inputs)) = positional.split_first() else {
+        return Err(CliError::MissingPackage);
+    };
+    if inputs.is_empty() {
+        return Err(CliError::MissingPackInput);
+    }
+    if interactive && inputs.len() != 1 {
+        return Err(CliError::InteractiveRequiresOneDirectory);
+    }
+    Ok(PackCommand {
+        name: (*name).to_owned(),
+        inputs: inputs.iter().map(PathBuf::from).collect(),
+        interactive,
+    })
 }
 
 fn parse_remove_command(args: &[String]) -> Result<RemoveCommand, CliError> {
@@ -370,6 +512,10 @@ enum CliError {
     ConflictingModes,
     MissingCommand,
     MissingPackage,
+    MissingPackInput,
+    InteractiveRequiresOneDirectory,
+    PromptClosed,
+    PromptIo(String),
     BackupDirectoryNotConfigured,
     InvalidConfigCommand,
     UnknownCommand(String),
@@ -389,6 +535,15 @@ impl std::fmt::Display for CliError {
             }
             Self::MissingCommand => write!(formatter, "a command is required\n{USAGE}"),
             Self::MissingPackage => write!(formatter, "a package name is required\n{USAGE}"),
+            Self::MissingPackInput => {
+                write!(formatter, "pack requires at least one path\n{USAGE}")
+            }
+            Self::InteractiveRequiresOneDirectory => write!(
+                formatter,
+                "interactive pack requires exactly one directory\n{USAGE}"
+            ),
+            Self::PromptClosed => write!(formatter, "package conflict confirmation was cancelled"),
+            Self::PromptIo(error) => write!(formatter, "could not read confirmation: {error}"),
             Self::BackupDirectoryNotConfigured => {
                 write!(formatter, "config.backup_dir is not configured")
             }

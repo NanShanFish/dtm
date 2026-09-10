@@ -4,6 +4,8 @@ Dockerfile*
 Makefile
 README.md
 target/*
-!target/release/
-target/release/*
-!target/release/dtm
+!target/test-inter/
+target/test-inter/*
+!target/test-inter/release/
+target/test-inter/release/*
+!target/test-inter/release/dtm

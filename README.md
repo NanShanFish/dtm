@@ -6,10 +6,13 @@ Run:
 make test-inter
 ```
 
-The target builds `dtm`, creates a test image containing the release binary and
-files from `test/fixtures/home`, then starts a shell as an unprivileged `dtm`
-user. The container is started with `--rm`, so changes made inside the shell are
-discarded when you exit.
+The target builds a static PIE release binary in `target/test-inter`, creates a
+test image containing that binary and files from `test/fixtures/home`, then
+starts a shell as an unprivileged `dtm` user. The dedicated static build avoids
+leaking the host system's GLIBC version requirement into the Debian test image;
+ordinary `make build` output remains in `target/release`. The container is
+started with `--rm`, so changes made inside the shell are discarded when you
+exit.
 
 Inside the shell, the test fixture is the user's home directory:
 
@@ -35,6 +38,48 @@ Run and apply one package:
 dtm stow <PACKAGE>
 dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>
 ```
+
+Create or extend a package from existing configuration files, then install it:
+
+```sh
+dtm pack <PACKAGE> <PATH>...
+dtm pack -i <PACKAGE> <DIRECTORY>
+```
+
+A non-interactive pack accepts any number of files or directories. Directory
+arguments are scanned recursively. During recursive scanning, common dependency
+and cache directories such as `node_modules`, `__pycache__`, `.git`, `.venv`,
+`target`, `dist`, and `build` are ignored. An explicitly named file or directory
+is always accepted even when its name is normally ignored; the ignore list only
+applies to descendant directories discovered during recursive scanning.
+
+Interactive pack presents a file tree rooted at the one supplied directory. Use
+Space to select a file or every file below a directory, `a` to select or clear
+everything, the arrow keys or `h/j/k/l` to navigate and fold directories, Enter
+to confirm, and `q`, Escape, or Ctrl-C to cancel. Directories show unselected,
+partially selected, and fully selected states, so selecting everything and then
+excluding individual files or subdirectories is supported. Interactive pack
+requires a terminal and does not display file contents or diffs.
+
+Each selected source is assigned to the nearest parent from the top-level
+`path` configuration. Its relative path is stored below
+`<pkgs_dir>/<PACKAGE>/<PATH_NAME>`, with every leading `.` path component
+converted to `dot-`. The mapping must round-trip exactly through dtm's package
+naming rules; ambiguous literal `dot-*` names and names containing `.tmpl` are
+rejected before any file is copied.
+
+The target package may already exist. When a mapped package file already exists,
+dtm asks for `y/n` confirmation before copying anything. Answering `n` skips
+that source and leaves both the source and existing package file unchanged.
+Package directories, symlinks, and special files at a conflicting package path
+are rejected.
+
+Pack first validates the complete plan and copies every accepted source into a
+temporary package area. Only after all copies succeed does it update the package
+and delete the original files, then it applies the complete package in normal
+stow mode. If package update, source deletion, or stow fails, dtm removes targets
+installed by this attempt, restores deleted sources, and restores overwritten
+package files. Existing package entries unrelated to the pack plan are retained.
 
 The `stow` command prints one tab-separated line per scanned file containing its
 source path, target path, and type (`symlink` or `template`), then applies the

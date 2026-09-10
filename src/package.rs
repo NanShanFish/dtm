@@ -445,7 +445,7 @@ fn apply_entry(
     Ok(EntryAction::Applied(backup))
 }
 
-fn target_is_current_entry(
+pub(crate) fn target_is_current_entry(
     entry: &PackageEntry,
     rendered: Option<&str>,
 ) -> Result<bool, PackageError> {
@@ -543,7 +543,7 @@ fn create_symlink(_source: &Path, _target: &Path) -> Result<(), PackageError> {
     Err(PackageError::UnsupportedPlatform)
 }
 
-fn nearest_path_target<'a>(
+pub(crate) fn nearest_path_target<'a>(
     target: &Path,
     paths: &'a BTreeMap<String, String>,
 ) -> Option<(&'a str, PathBuf)> {
@@ -565,7 +565,7 @@ fn nearest_path_target<'a>(
         .map(|(name, relative, _)| (name, relative))
 }
 
-fn reverse_backup_path(path: &Path) -> Result<PathBuf, PackageError> {
+pub(crate) fn reverse_backup_path(path: &Path) -> Result<PathBuf, PackageError> {
     map_backup_path(path, true)
 }
 
@@ -687,7 +687,7 @@ fn scan_restore_directory(
     Ok(())
 }
 
-fn validate_package_name(name: &str) -> Result<(), PackageError> {
+pub(crate) fn validate_package_name(name: &str) -> Result<(), PackageError> {
     if name.is_empty()
         || name.contains(std::path::MAIN_SEPARATOR)
         || Path::new(name).components().any(|component| {
@@ -754,7 +754,7 @@ fn scan_directory(
     Ok(())
 }
 
-fn deployment_name(name: &std::ffi::OsStr) -> Option<(EntryKind, std::ffi::OsString)> {
+pub(crate) fn deployment_name(name: &std::ffi::OsStr) -> Option<(EntryKind, std::ffi::OsString)> {
     let name = name.to_str()?;
     let (kind, name) = if let Some(marker_position) = name.rfind(".tmpl") {
         if name == ".tmpl" {

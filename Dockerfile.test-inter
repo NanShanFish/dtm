@@ -8,7 +8,7 @@ RUN groupadd --gid "${USER_GID}" "${USER_NAME}" \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home \
         --shell /bin/bash "${USER_NAME}"
 
-COPY target/release/dtm /usr/local/bin/dtm
+COPY target/test-inter/release/dtm /usr/local/bin/dtm
 COPY test/fixtures/home/ /home/${USER_NAME}/
 
 RUN chmod 0755 /usr/local/bin/dtm \

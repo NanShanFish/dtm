@@ -129,6 +129,80 @@ fn restore_rejects_stow_options_and_extra_packages() {
 }
 
 #[test]
+fn parses_non_interactive_and_interactive_pack() {
+    let cli = Cli::parse(strings(&[
+        "--config",
+        "/tmp/config.yaml",
+        "pack",
+        "git",
+        "/tmp/.gitconfig",
+        "/tmp/.config/git",
+    ]))
+    .expect("non-interactive pack");
+    assert_eq!(cli.config, Some(PathBuf::from("/tmp/config.yaml")));
+    assert_eq!(
+        cli.command,
+        Some(Command::Pack(PackCommand {
+            name: "git".to_owned(),
+            inputs: vec![
+                PathBuf::from("/tmp/.gitconfig"),
+                PathBuf::from("/tmp/.config/git"),
+            ],
+            interactive: false,
+        }))
+    );
+
+    assert_eq!(
+        Cli::parse(strings(&["pack", "-i", "git", "/tmp"]))
+            .unwrap()
+            .command,
+        Some(Command::Pack(PackCommand {
+            name: "git".to_owned(),
+            inputs: vec![PathBuf::from("/tmp")],
+            interactive: true,
+        }))
+    );
+}
+
+#[test]
+fn pack_validates_inputs_and_interactive_root_count() {
+    assert_eq!(
+        Cli::parse(strings(&["pack", "git"])),
+        Err(CliError::MissingPackInput)
+    );
+    assert_eq!(
+        Cli::parse(strings(&["pack", "-i", "git", "/one", "/two"])),
+        Err(CliError::InteractiveRequiresOneDirectory)
+    );
+    assert_eq!(
+        Cli::parse(strings(&["pack", "--force", "git", "/tmp"])),
+        Err(CliError::UnknownArgument("--force".to_owned()))
+    );
+}
+
+#[test]
+fn package_conflict_confirmation_retries_and_accepts_yes_or_no() {
+    let entry = PackEntry {
+        source: PathBuf::from("/source"),
+        package_path: PathBuf::from("/package"),
+        target: PathBuf::from("/source"),
+        conflicts: true,
+    };
+    let mut input = std::io::Cursor::new(b"maybe\ny\n");
+    let mut output = Vec::new();
+    assert!(confirm_package_conflict_with(&entry, &mut input, &mut output).unwrap());
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("please answer y or n")
+    );
+
+    let mut input = std::io::Cursor::new(b"n\n");
+    let mut output = Vec::new();
+    assert!(!confirm_package_conflict_with(&entry, &mut input, &mut output).unwrap());
+}
+
+#[test]
 fn rejects_bare_package_name() {
     assert_eq!(
         Cli::parse(strings(&["git"])),
