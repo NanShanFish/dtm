@@ -9,3 +9,7 @@ path:
 # Variables are ordinary strings used by interpolation and templates.
 variables:
   example_name: dtm
+
+config:
+  pkgs_dir: ${home}/dot/pkgs
+  backup_dir: ${home}/.local/backup

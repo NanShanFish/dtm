@@ -147,8 +147,9 @@ dtm config list
 ```
 
 `config list` prints only keys explicitly present in the configuration file,
-using tab-separated columns. It lists `pkgs_dir` and `backup_dir` when they are
-configured.
+using tab-separated columns. Its values are resolved through `path` and
+`variables`, so `${home}/dotfiles` is printed as the actual absolute path. It
+lists `pkgs_dir` and `backup_dir` when they are configured.
 
 `config set pkgs_dir` resolves its input to an existing absolute directory.
 `config set backup_dir` resolves its input to an absolute path and creates the
@@ -170,8 +171,8 @@ and ordinary template variables:
 
 ```yaml
 config:
-  pkgs_dir: /home/user/dotfiles
-  backup_dir: /home/user/.local/state/dtm/backups
+  pkgs_dir: ${home}/dotfiles
+  backup_dir: ${home}/.local/state/dtm/backups
 
 path:
   config_home: ${home}/.config

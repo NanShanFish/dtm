@@ -88,23 +88,48 @@ fn resolves_pkgs_directory_priority() {
 }
 
 #[test]
-fn rejects_relative_configured_pkgs_directory() {
-    let error = resolve_pkgs_dir(Some(Path::new("relative")), &context(), None)
-        .expect_err("relative configured path");
+fn configured_runtime_paths_must_be_absolute_after_interpolation() {
+    let configured = RawRuntimeConfig {
+        pkgs_dir: Some(PathBuf::from("${base}/packages")),
+        backup_dir: Some(PathBuf::from("${base}/backups")),
+    };
+    let values = BTreeMap::from([("base".to_owned(), "/srv/dtm".to_owned())]);
+    let resolved = resolve_configured_runtime(&configured, &values, Path::new("config.yaml"), true)
+        .expect("resolve runtime paths");
 
-    assert!(matches!(error, ConfigError::RelativePkgsDirectory { .. }));
+    assert_eq!(resolved.pkgs_dir, Some(PathBuf::from("/srv/dtm/packages")));
+    assert_eq!(resolved.backup_dir, Some(PathBuf::from("/srv/dtm/backups")));
+
+    let relative = RawRuntimeConfig {
+        pkgs_dir: Some(PathBuf::from("relative/packages")),
+        backup_dir: None,
+    };
+    assert!(matches!(
+        resolve_configured_runtime(&relative, &BTreeMap::new(), Path::new("config.yaml"), true),
+        Err(ConfigError::RelativePkgsDirectory { .. })
+    ));
 }
 
 #[test]
-fn configured_backup_directory_must_be_absolute() {
-    assert_eq!(
-        resolve_backup_dir(Some(Path::new("/backup"))).expect("absolute backup path"),
-        Some(PathBuf::from("/backup"))
-    );
-    assert_eq!(resolve_backup_dir(None).expect("missing backup path"), None);
+fn configured_runtime_paths_reject_unknown_references() {
+    let configured = RawRuntimeConfig {
+        pkgs_dir: Some(PathBuf::from("${missing}/packages")),
+        backup_dir: None,
+    };
+    let error = resolve_configured_runtime(
+        &configured,
+        &BTreeMap::new(),
+        Path::new("config.yaml"),
+        true,
+    )
+    .expect_err("unknown runtime reference");
+
     assert!(matches!(
-        resolve_backup_dir(Some(Path::new("relative-backup"))),
-        Err(ConfigError::RelativeBackupDirectory { .. })
+        error,
+        ConfigError::Evaluate {
+            source: EvaluationError::UnknownReference { variable, reference },
+            ..
+        } if variable == "config.pkgs_dir" && reference == "missing"
     ));
 }
 
@@ -196,6 +221,26 @@ fn command_line_pkgs_directory_overrides_config() {
 }
 
 #[test]
+fn command_line_pkgs_directory_overrides_invalid_configured_value() {
+    let path = temporary_path("invalid-dot-dir-override");
+    fs::write(
+        &path,
+        "config:\n  pkgs_dir: ${missing}/dotfiles\npath: {}\n",
+    )
+    .expect("write fixture");
+
+    let config = Config::load(Some(&path), Some(Path::new("relative/dotfiles")))
+        .expect("command-line override should win");
+    assert_eq!(
+        config.config.pkgs_dir,
+        env::current_dir().unwrap().join("relative/dotfiles")
+    );
+
+    let error = configured_runtime_config(Some(&path)).expect_err("list must validate config");
+    assert!(matches!(error, ConfigError::Evaluate { .. }));
+    let _ = fs::remove_file(path);
+}
+#[test]
 fn configured_runtime_config_returns_only_explicit_values() {
     let path = temporary_path("configured-runtime-only");
     fs::write(
@@ -217,25 +262,44 @@ fn configured_runtime_config_returns_only_explicit_values() {
 }
 
 #[test]
-fn configured_runtime_config_preserves_explicit_values_without_loading_defaults() {
+fn configured_runtime_config_returns_resolved_explicit_values_without_defaults() {
     let path = temporary_path("configured-runtime-values");
     fs::write(
         &path,
-        "config:\n  pkgs_dir: relative/packages\n  backup_dir: relative/backups\n",
+        "config:\n  pkgs_dir: ${repos}/dotfiles\n  backup_dir: ${state_home}/${profile}/backups\npath:\n  repos: /srv/repos\n  state_home: ${home}/.local/state\nvariables:\n  profile: personal\n",
     )
     .expect("write config");
 
     let configured = configured_runtime_config(Some(&path)).expect("read configured runtime");
     assert_eq!(
         configured.pkgs_dir,
-        Some(PathBuf::from("relative/packages"))
+        Some(PathBuf::from("/srv/repos/dotfiles"))
     );
     assert_eq!(
         configured.backup_dir,
-        Some(PathBuf::from("relative/backups"))
+        Some(PathBuf::from(format!(
+            "{}/.local/state/personal/backups",
+            fixture_home()
+        )))
     );
 
-    let error = Config::load(Some(&path), None).expect_err("relative runtime paths");
+    let loaded = Config::load(Some(&path), None).expect("load runtime paths");
+    assert_eq!(loaded.config.pkgs_dir, configured.pkgs_dir.unwrap());
+    assert_eq!(loaded.config.backup_dir, configured.backup_dir);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn configured_runtime_config_rejects_relative_resolved_values() {
+    let path = temporary_path("relative-runtime-values");
+    fs::write(
+        &path,
+        "config:\n  pkgs_dir: ${directory}/packages\nvariables:\n  directory: relative\n",
+    )
+    .expect("write config");
+
+    let error = configured_runtime_config(Some(&path)).expect_err("relative runtime path");
     assert!(matches!(error, ConfigError::RelativePkgsDirectory { .. }));
 
     let _ = fs::remove_file(path);

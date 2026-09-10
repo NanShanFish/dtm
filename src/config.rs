@@ -67,26 +67,20 @@ impl Config {
     }
 
     pub fn from_path(path: &Path, pkgs_dir_override: Option<&Path>) -> Result<Self, ConfigError> {
-        let raw = load_raw_config(path)?;
-        let context = EvaluationContext::from_environment()?;
-        let pkgs_dir =
-            resolve_pkgs_dir(raw.config.pkgs_dir.as_deref(), &context, pkgs_dir_override)?;
-        let backup_dir = resolve_backup_dir(raw.config.backup_dir.as_deref())?;
-        let (paths, variables) =
-            resolve_values(&raw.path, &raw.variables, &context).map_err(|source| {
-                ConfigError::Evaluate {
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })?;
+        let resolved = resolve_config_file(path, pkgs_dir_override.is_none())?;
+        let pkgs_dir = resolve_pkgs_dir(
+            resolved.config.pkgs_dir.as_deref(),
+            &resolved.context,
+            pkgs_dir_override,
+        )?;
 
         Ok(Self {
             config: RuntimeConfig {
                 pkgs_dir,
-                backup_dir,
+                backup_dir: resolved.config.backup_dir,
             },
-            paths,
-            variables,
+            paths: resolved.paths,
+            variables: resolved.variables,
         })
     }
 }
@@ -97,6 +91,14 @@ pub struct ConfiguredRuntimeConfig {
     pub backup_dir: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct ResolvedConfigFile {
+    config: ConfiguredRuntimeConfig,
+    paths: Values,
+    variables: Values,
+    context: EvaluationContext,
+}
+
 pub fn configured_runtime_config(
     path: Option<&Path>,
 ) -> Result<ConfiguredRuntimeConfig, ConfigError> {
@@ -104,10 +106,31 @@ pub fn configured_runtime_config(
         Some(path) => path.to_path_buf(),
         None => default_config_path()?,
     };
-    let raw = load_raw_config(&path)?;
-    Ok(ConfiguredRuntimeConfig {
-        pkgs_dir: raw.config.pkgs_dir,
-        backup_dir: raw.config.backup_dir,
+    Ok(resolve_config_file(&path, true)?.config)
+}
+
+fn resolve_config_file(
+    path: &Path,
+    resolve_pkgs_dir: bool,
+) -> Result<ResolvedConfigFile, ConfigError> {
+    let raw = load_raw_config(path)?;
+    let context = EvaluationContext::from_environment()?;
+    let (paths, variables) =
+        resolve_values(&raw.path, &raw.variables, &context).map_err(|source| {
+            ConfigError::Evaluate {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    let mut values = paths.clone();
+    values.extend(variables.clone());
+    let config = resolve_configured_runtime(&raw.config, &values, path, resolve_pkgs_dir)?;
+
+    Ok(ResolvedConfigFile {
+        config,
+        paths,
+        variables,
+        context,
     })
 }
 
@@ -379,22 +402,88 @@ fn resolve_pkgs_dir(
         });
     }
 
-    match configured {
-        Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
-        Some(path) => Err(ConfigError::RelativePkgsDirectory {
-            path: path.to_path_buf(),
-        }),
-        None => Ok(context.current_dir.clone()),
+    Ok(configured
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| context.current_dir.clone()))
+}
+
+fn resolve_configured_runtime(
+    configured: &RawRuntimeConfig,
+    values: &Values,
+    config_path: &Path,
+    resolve_pkgs_dir: bool,
+) -> Result<ConfiguredRuntimeConfig, ConfigError> {
+    let pkgs_dir = if resolve_pkgs_dir {
+        resolve_configured_path(
+            "config.pkgs_dir",
+            configured.pkgs_dir.as_deref(),
+            values,
+            |path| ConfigError::RelativePkgsDirectory { path },
+        )
+        .map_err(|error| map_runtime_path_error(error, config_path))?
+    } else {
+        None
+    };
+    let backup_dir = resolve_configured_path(
+        "config.backup_dir",
+        configured.backup_dir.as_deref(),
+        values,
+        |path| ConfigError::RelativeBackupDirectory { path },
+    )
+    .map_err(|error| map_runtime_path_error(error, config_path))?;
+
+    Ok(ConfiguredRuntimeConfig {
+        pkgs_dir,
+        backup_dir,
+    })
+}
+
+fn resolve_configured_path<F>(
+    name: &str,
+    configured: Option<&Path>,
+    values: &Values,
+    relative_error: F,
+) -> Result<Option<PathBuf>, RuntimePathError>
+where
+    F: FnOnce(PathBuf) -> ConfigError,
+{
+    let Some(path) = configured else {
+        return Ok(None);
+    };
+    let path = resolve_runtime_path(name, path, values)?;
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Err(RuntimePathError::Relative(relative_error(path)))
     }
 }
 
-fn resolve_backup_dir(configured: Option<&Path>) -> Result<Option<PathBuf>, ConfigError> {
-    match configured {
-        Some(path) if path.is_absolute() => Ok(Some(path.to_path_buf())),
-        Some(path) => Err(ConfigError::RelativeBackupDirectory {
-            path: path.to_path_buf(),
-        }),
-        None => Ok(None),
+fn resolve_runtime_path(
+    name: &str,
+    path: &Path,
+    values: &Values,
+) -> Result<PathBuf, RuntimePathError> {
+    let value = path.to_string_lossy();
+    let mut resolver = VariableResolver::new(values);
+    resolver
+        .interpolate(name, &value)
+        .map(PathBuf::from)
+        .map_err(RuntimePathError::Evaluate)
+}
+
+#[derive(Debug)]
+enum RuntimePathError {
+    Relative(ConfigError),
+    Evaluate(EvaluationError),
+}
+
+fn map_runtime_path_error(error: RuntimePathError, config_path: &Path) -> ConfigError {
+    match error {
+        RuntimePathError::Relative(error) => error,
+        RuntimePathError::Evaluate(source) => ConfigError::Evaluate {
+            path: config_path.to_path_buf(),
+            source,
+        },
     }
 }
 
