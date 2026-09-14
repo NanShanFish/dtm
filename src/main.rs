@@ -15,9 +15,9 @@ use std::path::PathBuf;
 
 const USAGE: &str =
 "Usage:
-    dtm [--config <PATH>] stow [--pkgs-dir <PATH>] [-s | --semi-force | -f | --force] [-b | --backup] [--dry-run] <PACKAGE>
+    dtm [--config <PATH>] stow [--pkgs-dir <PATH>] [-s | --semi-force | -f | --force] [-b | --backup] [--dry-run] <PACKAGE>...
     dtm [--config <PATH>] pack [-i | --interactive] <PACKAGE> <PATH>...
-    dtm [--config <PATH>] rm [--skip-unmanaged] <PACKAGE>
+    dtm [--config <PATH>] rm [--skip-unmanaged] <PACKAGE>...
     dtm [--config <PATH>] restore <PACKAGE>
     dtm [--config <PATH>] config set pkgs_dir <PATH>
     dtm [--config <PATH>] config set backup_dir <PATH>
@@ -93,7 +93,11 @@ fn run_stow(
 ) -> Result<(), Box<dyn Error>> {
     let config = Config::load(config_path, command.pkgs_dir.as_deref())?;
     let template_values = config.template_values();
-    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.paths)?;
+    let plans = command
+        .names
+        .iter()
+        .map(|name| PackagePlan::load(&config.config.pkgs_dir, name, &config.paths))
+        .collect::<Result<Vec<_>, _>>()?;
     let backup_dir = if command.backup && command.mode != ApplyMode::Normal {
         Some(
             config
@@ -107,37 +111,41 @@ fn run_stow(
     };
 
     if command.dry_run {
-        for entry in &plan.entries {
-            println!(
-                "{}\t{}\t{}",
-                entry.source.display(),
-                entry.target.display(),
-                entry_kind_name(entry.kind)
-            );
+        for plan in &plans {
+            for entry in &plan.entries {
+                println!(
+                    "{}\t{}\t{}",
+                    entry.source.display(),
+                    entry.target.display(),
+                    entry_kind_name(entry.kind)
+                );
+            }
         }
         return Ok(());
     }
 
-    let report = match backup_dir {
-        Some(backup_dir) => {
-            plan.apply_with_backup(&config.paths, &template_values, command.mode, backup_dir)?
+    for plan in plans {
+        let report = match backup_dir {
+            Some(backup_dir) => {
+                plan.apply_with_backup(&config.paths, &template_values, command.mode, backup_dir)?
+            }
+            None => plan.apply(&template_values, command.mode)?,
+        };
+        for backup in report.backups {
+            eprintln!(
+                "backed up {} -> {}",
+                backup.original.display(),
+                backup.backup.display()
+            );
         }
-        None => plan.apply(&template_values, command.mode)?,
-    };
-    for backup in report.backups {
-        eprintln!(
-            "backed up {} -> {}",
-            backup.original.display(),
-            backup.backup.display()
-        );
-    }
-    for skipped in report.skipped {
-        eprintln!(
-            "warning: skipped {} -> {}: {}",
-            skipped.entry.source.display(),
-            skipped.entry.target.display(),
-            skipped.reason
-        );
+        for skipped in report.skipped {
+            eprintln!(
+                "warning: skipped {} -> {}: {}",
+                skipped.entry.source.display(),
+                skipped.entry.target.display(),
+                skipped.reason
+            );
+        }
     }
     Ok(())
 }
@@ -236,21 +244,27 @@ fn run_remove(
 ) -> Result<(), Box<dyn Error>> {
     let config = Config::load(config_path, None)?;
     let template_values = config.template_values();
-    let plan = PackagePlan::load(&config.config.pkgs_dir, &command.name, &config.paths)?;
+    let plans = command
+        .names
+        .iter()
+        .map(|name| PackagePlan::load(&config.config.pkgs_dir, name, &config.paths))
+        .collect::<Result<Vec<_>, _>>()?;
     let mode = if command.skip_unmanaged {
         RemoveMode::SkipUnmanaged
     } else {
         RemoveMode::Safe
     };
-    let report = plan.remove(&template_values, mode)?;
-    for entry in report.removed {
-        println!("removed {}", entry.target.display());
-    }
-    for entry in report.skipped {
-        eprintln!(
-            "warning: skipped target not managed by dtm: {}",
-            entry.target.display()
-        );
+    for plan in plans {
+        let report = plan.remove(&template_values, mode)?;
+        for entry in report.removed {
+            println!("removed {}", entry.target.display());
+        }
+        for entry in report.skipped {
+            eprintln!(
+                "warning: skipped target not managed by dtm: {}",
+                entry.target.display()
+            );
+        }
     }
     Ok(())
 }
@@ -303,7 +317,7 @@ enum Command {
 
 #[derive(Debug, PartialEq)]
 struct StowCommand {
-    name: String,
+    names: Vec<String>,
     pkgs_dir: Option<PathBuf>,
     mode: ApplyMode,
     backup: bool,
@@ -319,7 +333,7 @@ struct PackCommand {
 
 #[derive(Debug, PartialEq)]
 struct RemoveCommand {
-    name: String,
+    names: Vec<String>,
     skip_unmanaged: bool,
 }
 
@@ -417,7 +431,7 @@ fn parse_pack_command(args: &[String]) -> Result<PackCommand, CliError> {
 }
 
 fn parse_remove_command(args: &[String]) -> Result<RemoveCommand, CliError> {
-    let mut name = None;
+    let mut names = Vec::new();
     let mut skip_unmanaged = false;
 
     for argument in args {
@@ -426,17 +440,15 @@ fn parse_remove_command(args: &[String]) -> Result<RemoveCommand, CliError> {
             _ if argument.starts_with('-') => {
                 return Err(CliError::UnknownArgument(argument.to_owned()));
             }
-            _ => {
-                if name.is_some() {
-                    return Err(CliError::UnexpectedArgument(argument.to_owned()));
-                }
-                name = Some(argument.to_owned());
-            }
+            _ => names.push(argument.to_owned()),
         }
     }
 
+    if names.is_empty() {
+        return Err(CliError::MissingPackage);
+    }
     Ok(RemoveCommand {
-        name: name.ok_or(CliError::MissingPackage)?,
+        names,
         skip_unmanaged,
     })
 }
@@ -457,7 +469,7 @@ fn parse_restore_command(args: &[String]) -> Result<RestoreCommand, CliError> {
 }
 
 fn parse_stow_command(args: &[String]) -> Result<StowCommand, CliError> {
-    let mut name = None;
+    let mut names = Vec::new();
     let mut pkgs_dir = None;
     let mut mode = ApplyMode::Normal;
     let mut backup = false;
@@ -487,17 +499,15 @@ fn parse_stow_command(args: &[String]) -> Result<StowCommand, CliError> {
             _ if argument.starts_with('-') => {
                 return Err(CliError::UnknownArgument(argument.to_owned()));
             }
-            _ => {
-                if name.is_some() {
-                    return Err(CliError::UnexpectedArgument(argument.to_owned()));
-                }
-                name = Some(argument.to_owned());
-            }
+            _ => names.push(argument.to_owned()),
         }
     }
 
+    if names.is_empty() {
+        return Err(CliError::MissingPackage);
+    }
     Ok(StowCommand {
-        name: name.ok_or(CliError::MissingPackage)?,
+        names,
         pkgs_dir,
         mode,
         backup,

@@ -23,7 +23,7 @@ fn parses_stow_with_shared_and_stow_options() {
         Cli {
             config: Some(PathBuf::from("/tmp/config.yaml")),
             command: Some(Command::Stow(StowCommand {
-                name: "git".to_owned(),
+                names: vec!["git".to_owned()],
                 pkgs_dir: Some(PathBuf::from("/tmp/dotfiles")),
                 mode: ApplyMode::Normal,
                 backup: true,
@@ -62,7 +62,7 @@ fn parses_remove_in_safe_and_skip_unmanaged_modes() {
     assert_eq!(
         safe.command,
         Some(Command::Remove(RemoveCommand {
-            name: "git".to_owned(),
+            names: vec!["git".to_owned()],
             skip_unmanaged: false,
         }))
     );
@@ -79,21 +79,43 @@ fn parses_remove_in_safe_and_skip_unmanaged_modes() {
     assert_eq!(
         skip.command,
         Some(Command::Remove(RemoveCommand {
-            name: "git".to_owned(),
+            names: vec!["git".to_owned()],
             skip_unmanaged: true,
         }))
     );
 }
 
 #[test]
-fn remove_rejects_unknown_options_and_extra_packages() {
+fn parses_multiple_stow_and_remove_packages() {
+    let stow =
+        Cli::parse(strings(&["stow", "bash", "fish", "tmux"])).expect("multiple stow packages");
+    assert_eq!(
+        stow.command,
+        Some(Command::Stow(StowCommand {
+            names: vec!["bash".to_owned(), "fish".to_owned(), "tmux".to_owned()],
+            pkgs_dir: None,
+            mode: ApplyMode::Normal,
+            backup: false,
+            dry_run: false,
+        }))
+    );
+
+    let remove = Cli::parse(strings(&["rm", "bash", "--skip-unmanaged", "fish", "tmux"]))
+        .expect("multiple remove packages");
+    assert_eq!(
+        remove.command,
+        Some(Command::Remove(RemoveCommand {
+            names: vec!["bash".to_owned(), "fish".to_owned(), "tmux".to_owned()],
+            skip_unmanaged: true,
+        }))
+    );
+}
+
+#[test]
+fn remove_rejects_unknown_options_and_requires_a_package() {
     assert_eq!(
         Cli::parse(strings(&["rm", "--force", "git"])),
         Err(CliError::UnknownArgument("--force".to_owned()))
-    );
-    assert_eq!(
-        Cli::parse(strings(&["rm", "git", "tmux"])),
-        Err(CliError::UnexpectedArgument("tmux".to_owned()))
     );
     assert_eq!(Cli::parse(strings(&["rm"])), Err(CliError::MissingPackage));
 }

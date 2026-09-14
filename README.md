@@ -32,11 +32,12 @@ To use another container engine or a different local image name:
 make test-inter CONTAINER_ENGINE=docker IMAGE=dtm-test-inter:debug
 ```
 
-Run and apply one package:
+Apply one or more packages in the given order:
 
 ```sh
-dtm stow <PACKAGE>
-dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>
+dtm stow <PACKAGE>...
+dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>...
+dtm stow bash fish
 ```
 
 Create or extend a package from existing configuration files, then install it:
@@ -81,10 +82,11 @@ stow mode. If package update, source deletion, or stow fails, dtm removes target
 installed by this attempt, restores deleted sources, and restores overwritten
 package files. Existing package entries unrelated to the pack plan are retained.
 
-The `stow` command prints one tab-separated line per scanned file containing its
-source path, target path, and type (`symlink` or `template`), then applies the
-plan. Use `--dry-run` to only print the plan. These options belong only to the
-`stow` command.
+The `stow` command applies each package in argument order. All package plans are
+loaded before the first package is modified. Use `--dry-run` to print one
+tab-separated line per scanned file containing its source path, target path,
+and type (`symlink` or `template`) without applying any package. These options
+belong only to the `stow` command.
 
 Existing target files are handled as follows:
 
@@ -119,10 +121,11 @@ reversible. If the mapped backup path already exists, stow fails instead of
 overwriting it or creating a numbered backup; restore the existing backup
 first.
 
-Remove an installed package with:
+Remove one or more installed packages in the given order with:
 
 ```sh
-dtm rm <PACKAGE>
+dtm rm <PACKAGE>...
+dtm rm bash fish
 ```
 
 Removal is safe by default. Before deleting anything, dtm checks every entry in
@@ -136,11 +139,13 @@ Use `--skip-unmanaged` to leave those targets untouched and remove only entries
 that still pass the dtm ownership check:
 
 ```sh
-dtm rm --skip-unmanaged <PACKAGE>
+dtm rm --skip-unmanaged <PACKAGE>...
 ```
 
 Removal deletes only managed files and symbolic links. It does not recursively
-delete destination directories.
+delete destination directories. All requested package plans are loaded before
+the first package is removed, but execution is sequential and does not provide
+cross-package rollback if a later package encounters a runtime failure.
 
 Restore a package backup with:
 
