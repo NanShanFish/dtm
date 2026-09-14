@@ -1,265 +1,182 @@
-## Interactive verification environment
+# dtm
 
-Run:
+[简体中文](docs/README.zh_CN.md)
 
-```sh
-make test-inter
+dtm, d(o)t(file)m(anager), is a tool written in Rust for managing dotfiles on 
+Unix systems.
+
+## Installation
+
+```bash
+git clone https://github.com/nanshanfish/dtm.git
+cd dtm
+cargo build --release
+cp target/release/dtm /usr/local/bin/
 ```
 
-The target builds a static PIE release binary in `target/test-inter`, creates a
-test image containing that binary and files from `test/fixtures/home`, then
-starts a shell as an unprivileged `dtm` user. The dedicated static build avoids
-leaking the host system's GLIBC version requirement into the Debian test image;
-ordinary `make build` output remains in `target/release`. The container is
-started with `--rm`, so changes made inside the shell are discarded when you
-exit.
+## Command Overview
 
-Inside the shell, the test fixture is the user's home directory:
+| Command | Description |
+| --- | --- |
+| [`dtm stow [OPTIONS] <PACKAGE>...`](#stowing-packages) | Install one or more packages. |
+| [`dtm pack <PACKAGE> <PATH>...`](#packing) | Move existing files into a package and install it. |
+| [`dtm pack -i <PACKAGE> <DIRECTORY>`](#packing) | Interactively select files from a directory to pack. |
+| [`dtm rm [--skip-unmanaged] <PACKAGE>...`](#removing-packages) | Remove one or more installed packages. |
+| [`dtm restore <PACKAGE>`](#restoring-backups) | Remove a package and restore its backed-up files. |
+| [`dtm config set/get/list`](#configuration) | Set, inspect, or list configuration values. |
 
-```sh
-printf '%s\n' "$HOME"
-find "$HOME" -maxdepth 3 -type f -print
-which dtm
+## Usage
+
+Given a directory with the following structure:
+
+```
+<pkgs_dir>/
+    fish/
+        config_home/
+            config.tmpl.fish
+            conf.d/
+                interactive.fish
+        home/
+            other_file
 ```
 
-The target uses Podman by default. The image is rebuilt on the next invocation
-when the binary or fixture files change. Podman may reuse the base image and
-package layers, but no container state is reused.
+When you run `dtm stow fish`, dtm looks for a subdirectory named `fish` under 
+the configured `pkgs_dir` directory. For each subdirectory of `fish`, dtm looks 
+for a corresponding entry in the configuration's `path` section. For example, 
+with the following configuration:
 
-To use another container engine or a different local image name:
-
-```sh
-make test-inter CONTAINER_ENGINE=docker IMAGE=dtm-test-inter:debug
+```
+path:
+    config_home: ${home}/.config
 ```
 
-Apply one or more packages in the given order:
+The predefined `home` value uses the user's home directory by default, so 
+`config_home` resolves to `~/.config`. dtm therefore creates a symbolic link at 
+`~/.config/fish/conf.d/interactive.fish` that points to 
+`<pkgs_dir>/fish/config_home/conf.d/interactive.fish`.
 
-```sh
-dtm stow <PACKAGE>...
-dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>...
-dtm stow bash fish
+Files whose names contain `.tmpl` are handled differently. dtm searches their 
+contents for fields enclosed by `{==}` and fills them using values from the 
+configuration's `variable` section. It then writes the rendered file to the 
+corresponding path after removing `.tmpl` from the filename. For example, 
+`<pkgs_dir>/fish/config_home/config.tmpl.fish` is rendered to 
+`~/.config/fish/config.fish`.
+
+The default configuration path is `$XDG_CONFIG_HOME/dtm/config.yaml` when 
+`XDG_CONFIG_HOME` is set, or `$HOME/.config/dtm/config.yaml` otherwise. You can 
+override it by placing `--config <PATH>` before any subcommand.
+
+## Stowing Packages
+
+```bash
+dtm stow [--pkgs-dir <PATH>] [-s | --semi-force] [-f | --force] [-b | --backup] [--dry-run] <pkg_name1> <pkg_name2> ...
 ```
 
-Create or extend a package from existing configuration files, then install it:
+Options:
 
-```sh
-dtm pack <PACKAGE> <PATH>...
-dtm pack -i <PACKAGE> <DIRECTORY>
+- `--pkgs-dir <PATH>`: directly specify the location of `pkgs_dir`.
+- `-s / --semi-force`: remove a conflicting target when it is a symbolic link 
+not managed by dtm.
+- `-f / --force`: remove a conflicting target not managed by dtm.
+- `-b / --backup`: move conflicting files to `backup_dir` before removal; 
+requires the `backup_dir` configuration field.
+- `--dry-run`: show the planned operations without making changes.
+
+### Packing
+
+```bash
+dtm pack <pkg_name> <PATH>...
+dtm pack [-i | --interactive] <pkg_name> <DIRECTORY>
 ```
 
-A non-interactive pack accepts any number of files or directories. Directory
-arguments are scanned recursively. During recursive scanning, common dependency
-and cache directories such as `node_modules`, `__pycache__`, `.git`, `.venv`,
-`target`, `dist`, and `build` are ignored. An explicitly named file or directory
-is always accepted even when its name is normally ignored; the ignore list only
-applies to descendant directories discovered during recursive scanning.
+This command moves files from the specified paths into the corresponding 
+locations in dtm's package structure, then creates links at their original 
+locations.
 
-Interactive pack presents a file tree rooted at the one supplied directory. Use
-Space to select a file or every file below a directory, `a` to select or clear
-everything, the arrow keys or `h/j/k/l` to navigate and fold directories, Enter
-to confirm, and `q`, Escape, or Ctrl-C to cancel. Directories show unselected,
-partially selected, and fully selected states, so selecting everything and then
-excluding individual files or subdirectories is supported. Interactive pack
-requires a terminal and does not display file contents or diffs.
+When packing, dtm uses the most specific configured path whenever possible. For 
+example, when running `dtm pack fish ~/.config/fish/config.fish`, if the 
+configuration defines `config_home: ${home}/.config`, the file is moved to 
+`<pkgs_dir>/fish/config_home/fish/config.fish` rather than 
+`<pkgs_dir>/fish/home/dot-config/fish/config.fish`.
 
-Each selected source is assigned to the nearest parent from the top-level
-`path` configuration. Its relative path is stored below
-`<pkgs_dir>/<PACKAGE>/<PATH_NAME>`, with every leading `.` path component
-converted to `dot-`. The mapping must round-trip exactly through dtm's package
-naming rules; ambiguous literal `dot-*` names and names containing `.tmpl` are
-rejected before any file is copied.
+Similarly, if `fish_config: ${home}/.config/fish` is also defined, the file is 
+moved to `<pkgs_dir>/fish/fish_config/config.fish`.
 
-The target package may already exist. When a mapped package file already exists,
-dtm asks for `y/n` confirmation before copying anything. Answering `n` skips
-that source and leaves both the source and existing package file unchanged.
-Package directories, symlinks, and special files at a conflicting package path
-are rejected.
+Options:
 
-Pack first validates the complete plan and copies every accepted source into a
-temporary package area. Only after all copies succeed does it update the package
-and delete the original files, then it applies the complete package in normal
-stow mode. If package update, source deletion, or stow fails, dtm removes targets
-installed by this attempt, restores deleted sources, and restores overwritten
-package files. Existing package entries unrelated to the pack plan are retained.
+- `-i / --interactive`: accepts exactly one `DIRECTORY` argument and opens an 
+interactive interface for selecting which files to pack. This is useful when 
+you want to selectively pack only some configuration files from a directory. 
+The command ignores common dependency directories and VCS directories such as 
+`.git` while scanning. Files and directories passed directly as arguments are 
+not ignored.
 
-The `stow` command applies each package in argument order. All package plans are
-loaded before the first package is modified. Use `--dry-run` to print one
-tab-separated line per scanned file containing its source path, target path,
-and type (`symlink` or `template`) without applying any package. These options
-belong only to the `stow` command.
+### Removing Packages
 
-Existing target files are handled as follows:
-
-```text
-(default)              warn and skip a different target
--s, --semi-force       replace a different symbolic link; keep a regular file
--f, --force            replace a different symbolic link or regular file
+```bash
+dtm rm [--skip-unmanaged] <pkg_name1> <pkg_name2>
 ```
 
-Add `-b` or `--backup` to move targets that `--semi-force` or `--force` would
-otherwise delete. Normal mode still skips conflicts, so backup has no effect in
-normal mode. Backups require `config.backup_dir` and use a fixed reverse mapping:
+Before removal, dtm verifies that every destination corresponding to a 
+dtm-managed file is still managed by dtm. If any destination is no longer 
+managed by dtm, the command exits without removing the package. If every 
+destination is still managed, the corresponding files are deleted. Use 
+`--skip-unmanaged` to bypass this strict validation and delete only files that 
+are still managed by dtm.
 
-```text
-<backup_dir>/<PACKAGE>/<NEAREST_PATH>/<reverse-mapped-relative-path>
+### Restoring Backups
+
+```bash
+dtm restore <pkg_name>
 ```
 
-For each target, dtm selects the configured path whose absolute value is the
-nearest parent of that target. Ordinary `variables` are never considered during
-this filesystem lookup. For example, with `home=/home/user` and
-`config_home=/home/user/.config` in the `path` block, a conflict at
-`/home/user/.config/app/settings` is backed up below
-`<backup_dir>/<PACKAGE>/config_home/app/settings`, not below
-`home/dot-config/app/settings`.
+This command removes the package and restores the original files backed up by 
+the `-b` option of the `stow` command.
 
-Every hidden relative path component is converted from a leading `.` to
-`dot-`, so `${home}/.gitconfig` becomes
-`<backup_dir>/git/home/dot-gitconfig` and
-`${config_home}/app/.state` becomes
-`<backup_dir>/<PACKAGE>/config_home/app/dot-state`. The mapping is fixed and
-reversible. If the mapped backup path already exists, stow fails instead of
-overwriting it or creating a numbered backup; restore the existing backup
-first.
+## Configuration
 
-Remove one or more installed packages in the given order with:
-
-```sh
-dtm rm <PACKAGE>...
-dtm rm bash fish
-```
-
-Removal is safe by default. Before deleting anything, dtm checks every entry in
-the current package plan with the same ownership test used for idempotent stow:
-a symlink must still point to its package source, and a rendered template must
-still have exactly the expected contents. A missing, modified, replaced, or
-redirected target is not managed by dtm. If any such target exists, the entire
-remove operation stops without deleting any package entry.
-
-Use `--skip-unmanaged` to leave those targets untouched and remove only entries
-that still pass the dtm ownership check:
-
-```sh
-dtm rm --skip-unmanaged <PACKAGE>...
-```
-
-Removal deletes only managed files and symbolic links. It does not recursively
-delete destination directories. All requested package plans are loaded before
-the first package is removed, but execution is sequential and does not provide
-cross-package rollback if a later package encounters a runtime failure.
-
-Restore a package backup with:
-
-```sh
-dtm restore <PACKAGE>
-```
-
-Restore first scans the complete package backup and validates that every backup
-maps to the package's current plan. It then performs the same safe, whole-package
-removal as `dtm rm`; this preflight checks every planned target, including
-installed entries that have no backup. If any target is missing, modified,
-points elsewhere, or any backup entry cannot be mapped, the whole restore is
-rejected without deleting a target or moving a backup.
-
-After both preflights succeed, dtm uninstalls the complete package, moves the
-backed-up files into their original locations, and removes the now-empty package
-backup directories. Consequently, package entries without backups remain
-uninstalled after restore; only the original conflicting files are restored.
-
-A template is rendered before the target is checked. A regular target whose
-bytes already match the rendered template is left unchanged.
-
-
-By default, `dtm` loads:
-
-```text
-$XDG_CONFIG_HOME/dtm/config.yaml
-```
-
-When `XDG_CONFIG_HOME` is not set, it uses `~/.config/dtm/config.yaml`.
-Use the shared `--config` option before `stow`, `rm`, `restore`, or `config` to
-select a different file:
-
-```sh
-dtm --config /path/to/config.yaml stow <PACKAGE>
-dtm --config /path/to/config.yaml rm <PACKAGE>
-dtm --config /path/to/config.yaml restore <PACKAGE>
-dtm --config /path/to/config.yaml config get pkgs_dir
-```
-
-Persist or inspect runtime directories with:
-
-```sh
-dtm config set pkgs_dir /path/to/dotfiles
-dtm config get pkgs_dir
-dtm config set backup_dir /path/to/backups
-dtm config get backup_dir
-dtm config list
-```
-
-`config list` prints only keys explicitly present in the configuration file,
-using tab-separated columns. Its values are resolved through `path` and
-`variables`, so `${home}/dotfiles` is printed as the actual absolute path. It
-lists `pkgs_dir` and `backup_dir` when they are configured.
-
-`config set pkgs_dir` resolves its input to an existing absolute directory.
-`config set backup_dir` resolves its input to an absolute path and creates the
-directory when needed. Deployment options such as `--pkgs-dir`, `--dry-run`,
-backup, and force modes are accepted only by `stow`. The `--skip-unmanaged`
-option is accepted only by `rm`; `rm` and `restore` use the configured package
-directory, and `restore` also uses the configured backup directory.
-
-`config.pkgs_dir` must be an absolute path. It defaults to the current working
-directory when omitted. The stow-only `--pkgs-dir` option overrides it for the
-current run without changing the configuration file:
-
-```sh
-dtm stow --pkgs-dir /path/to/dotfiles <PACKAGE>
-```
-
-Configuration uses YAML with separate runtime configuration, filesystem paths,
-and ordinary template variables:
+The following is an example configuration. The predefined `root` and `home` 
+paths default to the filesystem root and the user's home directory, 
+respectively, and can be overridden in the configuration file. Environment 
+variables can be referenced using syntax such as `${$HOME}`.
 
 ```yaml
-config:
-  pkgs_dir: ${$HOME}/dotfiles
-  backup_dir: ${home}/.local/state/dtm/backups
-
 path:
   config_home: ${home}/.config
   local_bin: ${home}/.local/bin
   system_config: ${root}/etc/dtm
-  themed_config: ${config_home}/${theme}
 
 variables:
-  theme: dark
-  profile: personal
+  example_name: dtm
+
+config:
+  pkgs_dir: ${home}/dot/pkgs
+  backup_dir: ${home}/.local/backup
 ```
 
-`path` contains filesystem destination roots. Every resolved path must be
-absolute. Package first-level directories must name an entry in `path`, and
-backup nearest-parent matching plus restore lookup inspect only this block.
-`home` defaults to the current user's home directory and `root` defaults to the
-filesystem root (`/`); both are predefined paths and may be overridden in
-`path`.
+## TODO
 
-`variables` contains ordinary string values and is not inspected by filesystem
-operations, even when a string happens to look like an absolute path. The two
-blocks share interpolation resolution, so a path can reference a variable and
-a variable can reference a path. Defining the same name in both blocks is an
-error because template references would be ambiguous.
+- [ ] Add package hooks such as `pre-install`.
+- [ ] Support Windows.
+- [ ] Add package dependencies.
 
-`${NAME}` references a value declared in `path` or `variables`. `${$NAME}`
-explicitly references the process environment instead, and is supported in
-`config`, `path`, and `variables`. Environment names must match
-`[A-Za-z_][A-Za-z0-9_]*`. Before resolving any configured value or running a
-command, dtm checks every referenced environment variable; an unset variable
-causes the configuration load to fail, including when it occurs in a
-`config.pkgs_dir` value overridden by `--pkgs-dir`. A set but empty variable is
-valid. Environment values are inserted literally and any `${...}` text inside
-them is not evaluated again. Environment variables are never exposed unless
-they are referenced with the explicit `${$NAME}` form.
+## Contributing
 
-Templates receive the merged values from both blocks. Thus both
-`{=config_home=}` and `{=theme=}` are valid. Unknown references, malformed
-references, relative values in `path`, and cycles across either block are
-rejected.
+Pull requests are welcome. For major changes, please open an issue first
+to discuss what you would like to change.
+
+Please make sure to update tests as appropriate.
+
+### Interactive Testing
+
+```bash
+make test-inter
+```
+
+Use this command to start an interactive test environment. It creates a 
+disposable container image and removes the container when the session ends. 
+Test commands run inside the container.
+
+## Acknowledgments
+
+GNU Stow, for inspiring dtm's package-management design.
