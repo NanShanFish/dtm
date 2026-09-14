@@ -6,6 +6,7 @@ fn context() -> EvaluationContext {
         home: PathBuf::from("/home/tester"),
         root: PathBuf::from("/"),
         current_dir: PathBuf::from("/work/dotfiles"),
+        environment: BTreeMap::new(),
     }
 }
 
@@ -94,8 +95,14 @@ fn configured_runtime_paths_must_be_absolute_after_interpolation() {
         backup_dir: Some(PathBuf::from("${base}/backups")),
     };
     let values = BTreeMap::from([("base".to_owned(), "/srv/dtm".to_owned())]);
-    let resolved = resolve_configured_runtime(&configured, &values, Path::new("config.yaml"), true)
-        .expect("resolve runtime paths");
+    let resolved = resolve_configured_runtime(
+        &configured,
+        &values,
+        &BTreeMap::new(),
+        Path::new("config.yaml"),
+        true,
+    )
+    .expect("resolve runtime paths");
 
     assert_eq!(resolved.pkgs_dir, Some(PathBuf::from("/srv/dtm/packages")));
     assert_eq!(resolved.backup_dir, Some(PathBuf::from("/srv/dtm/backups")));
@@ -105,7 +112,13 @@ fn configured_runtime_paths_must_be_absolute_after_interpolation() {
         backup_dir: None,
     };
     assert!(matches!(
-        resolve_configured_runtime(&relative, &BTreeMap::new(), Path::new("config.yaml"), true),
+        resolve_configured_runtime(
+            &relative,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Path::new("config.yaml"),
+            true,
+        ),
         Err(ConfigError::RelativePkgsDirectory { .. })
     ));
 }
@@ -118,6 +131,7 @@ fn configured_runtime_paths_reject_unknown_references() {
     };
     let error = resolve_configured_runtime(
         &configured,
+        &BTreeMap::new(),
         &BTreeMap::new(),
         Path::new("config.yaml"),
         true,
@@ -167,6 +181,117 @@ fn rejects_duplicate_names_and_relative_paths() {
     assert!(matches!(
         resolve_values(&paths, &BTreeMap::new(), &context()),
         Err(EvaluationError::RelativePath { name, .. }) if name == "cache"
+    ));
+}
+
+#[test]
+fn resolves_environment_references_in_all_config_namespaces() {
+    let path = temporary_path("environment-references");
+    fs::write(
+        &path,
+        "config:\n  pkgs_dir: ${$HOME}/dotfiles\n  backup_dir: ${$HOME}/backups\npath:\n  environment_home: ${$HOME}\n  config_home: ${environment_home}/.config\nvariables:\n  shell_home: ${$HOME}\n",
+    )
+    .expect("write fixture");
+
+    let config = Config::load(Some(&path), None).expect("load environment references");
+    let home = fixture_home();
+    assert_eq!(
+        config.config.pkgs_dir,
+        PathBuf::from(&home).join("dotfiles")
+    );
+    assert_eq!(
+        config.config.backup_dir,
+        Some(PathBuf::from(&home).join("backups"))
+    );
+    assert_eq!(config.paths["environment_home"], home);
+    assert_eq!(
+        config.paths["config_home"],
+        format!("{}/.config", fixture_home())
+    );
+    assert_eq!(config.variables["shell_home"], fixture_home());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn environment_values_are_inserted_literally() {
+    let mut context = context();
+    context
+        .environment
+        .insert("LITERAL".to_owned(), "${missing}".to_owned());
+    let variables = BTreeMap::from([("value".to_owned(), "${$LITERAL}".to_owned())]);
+
+    let (_, resolved) =
+        resolve_values(&BTreeMap::new(), &variables, &context).expect("resolve literal value");
+
+    assert_eq!(resolved["value"], "${missing}");
+}
+
+#[test]
+fn missing_environment_is_checked_even_when_runtime_path_is_overridden() {
+    let path = temporary_path("missing-environment");
+    let missing = missing_environment_name();
+    let reference = format!("${{${missing}}}");
+    fs::write(
+        &path,
+        format!(
+            "config:\n  pkgs_dir: {reference}/dotfiles\nvariables:\n  invalid_later: ${{unknown}}\n"
+        ),
+    )
+    .expect("write fixture");
+
+    let error = Config::load(Some(&path), Some(Path::new("override")))
+        .expect_err("missing environment must fail before applying the override");
+    assert!(matches!(
+        error,
+        ConfigError::Evaluate {
+            source: EvaluationError::MissingEnvironmentVariable {
+                variable,
+                environment,
+            },
+            ..
+        } if variable == "config.pkgs_dir" && environment == missing
+    ));
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn config_set_checks_environment_before_writing_or_creating_directories() {
+    let config_path = temporary_path("set-missing-environment");
+    let backup_dir = temporary_path("uncreated-backup-directory");
+    let missing = missing_environment_name();
+    let original = format!("variables:\n  required: ${{${missing}}}\n");
+    fs::write(&config_path, &original).expect("write fixture");
+
+    let error = set_backup_dir(Some(&config_path), &backup_dir)
+        .expect_err("missing environment must prevent config update");
+
+    assert!(matches!(
+        error,
+        ConfigError::Evaluate {
+            source: EvaluationError::MissingEnvironmentVariable { environment, .. },
+            ..
+        } if environment == missing
+    ));
+    assert!(!backup_dir.exists());
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+
+    let _ = fs::remove_file(config_path);
+}
+
+#[test]
+fn rejects_invalid_environment_references() {
+    assert!(matches!(
+        validate_reference("value", "$"),
+        Err(EvaluationError::EmptyEnvironmentReference { variable }) if variable == "value"
+    ));
+    assert!(matches!(
+        validate_reference("value", "$9HOME"),
+        Err(EvaluationError::InvalidEnvironmentReference {
+            variable,
+            environment,
+        }) if variable == "value" && environment == "9HOME"
     ));
 }
 
@@ -432,6 +557,19 @@ fn default_path_uses_xdg_shape() {
 
 fn fixture_home() -> String {
     env::var("HOME").expect("HOME is set for tests")
+}
+
+fn missing_environment_name() -> String {
+    let name = format!(
+        "DTM_TEST_MISSING_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    );
+    assert!(env::var_os(&name).is_none());
+    name
 }
 
 fn temporary_path(name: &str) -> PathBuf {

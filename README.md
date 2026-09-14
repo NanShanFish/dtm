@@ -221,7 +221,7 @@ and ordinary template variables:
 
 ```yaml
 config:
-  pkgs_dir: ${home}/dotfiles
+  pkgs_dir: ${$HOME}/dotfiles
   backup_dir: ${home}/.local/state/dtm/backups
 
 path:
@@ -247,6 +247,17 @@ operations, even when a string happens to look like an absolute path. The two
 blocks share interpolation resolution, so a path can reference a variable and
 a variable can reference a path. Defining the same name in both blocks is an
 error because template references would be ambiguous.
+
+`${NAME}` references a value declared in `path` or `variables`. `${$NAME}`
+explicitly references the process environment instead, and is supported in
+`config`, `path`, and `variables`. Environment names must match
+`[A-Za-z_][A-Za-z0-9_]*`. Before resolving any configured value or running a
+command, dtm checks every referenced environment variable; an unset variable
+causes the configuration load to fail, including when it occurs in a
+`config.pkgs_dir` value overridden by `--pkgs-dir`. A set but empty variable is
+valid. Environment values are inserted literally and any `${...}` text inside
+them is not evaluated again. Environment variables are never exposed unless
+they are referenced with the explicit `${$NAME}` form.
 
 Templates receive the merged values from both blocks. Thus both
 `{=config_home=}` and `{=theme=}` are valid. Unknown references, malformed

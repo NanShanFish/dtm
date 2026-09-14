@@ -114,7 +114,12 @@ fn resolve_config_file(
     resolve_pkgs_dir: bool,
 ) -> Result<ResolvedConfigFile, ConfigError> {
     let raw = load_raw_config(path)?;
-    let context = EvaluationContext::from_environment()?;
+    let environment =
+        load_referenced_environment(&raw).map_err(|source| ConfigError::Evaluate {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let context = EvaluationContext::from_environment(environment)?;
     let (paths, variables) =
         resolve_values(&raw.path, &raw.variables, &context).map_err(|source| {
             ConfigError::Evaluate {
@@ -124,7 +129,13 @@ fn resolve_config_file(
         })?;
     let mut values = paths.clone();
     values.extend(variables.clone());
-    let config = resolve_configured_runtime(&raw.config, &values, path, resolve_pkgs_dir)?;
+    let config = resolve_configured_runtime(
+        &raw.config,
+        &values,
+        &context.environment,
+        path,
+        resolve_pkgs_dir,
+    )?;
 
     Ok(ResolvedConfigFile {
         config,
@@ -161,6 +172,7 @@ pub fn set_pkgs_dir(
         Some(path) => path.to_path_buf(),
         None => default_config_path()?,
     };
+    let original = read_config_for_update(&path)?;
     let pkgs_dir =
         fs::canonicalize(pkgs_dir).map_err(|source| ConfigError::ResolvePkgsDirectory {
             path: pkgs_dir.to_path_buf(),
@@ -170,7 +182,6 @@ pub fn set_pkgs_dir(
         return Err(ConfigError::PkgsDirectoryNotDirectory { path: pkgs_dir });
     }
 
-    let original = read_config_for_update(&path)?;
     let contents = update_runtime_path_yaml(&original, "pkgs_dir", &pkgs_dir);
     write_config_atomically(&path, contents.as_bytes())?;
 
@@ -185,6 +196,7 @@ pub fn set_backup_dir(
         Some(path) => path.to_path_buf(),
         None => default_config_path()?,
     };
+    let original = read_config_for_update(&path)?;
     let backup_dir = if backup_dir.is_absolute() {
         backup_dir.to_path_buf()
     } else {
@@ -202,7 +214,6 @@ pub fn set_backup_dir(
             source,
         })?;
 
-    let original = read_config_for_update(&path)?;
     let contents = update_runtime_path_yaml(&original, "backup_dir", &backup_dir);
     write_config_atomically(&path, contents.as_bytes())?;
 
@@ -212,7 +223,13 @@ pub fn set_backup_dir(
 fn read_config_for_update(path: &Path) -> Result<String, ConfigError> {
     match fs::read_to_string(path) {
         Ok(contents) => {
-            serde_yaml::from_str::<RawConfig>(&contents).map_err(|source| ConfigError::Parse {
+            let raw = serde_yaml::from_str::<RawConfig>(&contents).map_err(|source| {
+                ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            load_referenced_environment(&raw).map_err(|source| ConfigError::Evaluate {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -372,19 +389,90 @@ fn home_directory() -> Result<PathBuf, ConfigError> {
         .ok_or(ConfigError::HomeNotFound)
 }
 
+fn load_referenced_environment(raw: &RawConfig) -> Result<Values, EvaluationError> {
+    let mut references = BTreeMap::new();
+    for (name, value) in &raw.path {
+        collect_environment_references(name, value, &mut references)?;
+    }
+    for (name, value) in &raw.variables {
+        collect_environment_references(name, value, &mut references)?;
+    }
+    if let Some(path) = &raw.config.pkgs_dir {
+        collect_environment_references(
+            "config.pkgs_dir",
+            &path.to_string_lossy(),
+            &mut references,
+        )?;
+    }
+    if let Some(path) = &raw.config.backup_dir {
+        collect_environment_references(
+            "config.backup_dir",
+            &path.to_string_lossy(),
+            &mut references,
+        )?;
+    }
+
+    let mut environment = BTreeMap::new();
+    for (name, variable) in references {
+        match env::var(&name) {
+            Ok(value) => {
+                environment.insert(name, value);
+            }
+            Err(env::VarError::NotPresent) => {
+                return Err(EvaluationError::MissingEnvironmentVariable {
+                    variable,
+                    environment: name,
+                });
+            }
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(EvaluationError::NonUnicodeEnvironmentVariable {
+                    variable,
+                    environment: name,
+                });
+            }
+        }
+    }
+    Ok(environment)
+}
+
+fn collect_environment_references(
+    variable: &str,
+    template: &str,
+    references: &mut BTreeMap<String, String>,
+) -> Result<(), EvaluationError> {
+    let mut remaining = template;
+    while let Some(start) = remaining.find("${") {
+        remaining = &remaining[start + 2..];
+        let Some(end) = remaining.find('}') else {
+            break;
+        };
+        let reference = &remaining[..end];
+        if let Some(environment) = reference.strip_prefix('$') {
+            validate_environment_reference(variable, environment)?;
+            references
+                .entry(environment.to_owned())
+                .or_insert_with(|| variable.to_owned());
+        }
+        remaining = &remaining[end + 1..];
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct EvaluationContext {
     home: PathBuf,
     root: PathBuf,
     current_dir: PathBuf,
+    environment: Values,
 }
 
 impl EvaluationContext {
-    fn from_environment() -> Result<Self, ConfigError> {
+    fn from_environment(environment: Values) -> Result<Self, ConfigError> {
         Ok(Self {
             home: home_directory()?,
             root: PathBuf::from(ROOT_DIRECTORY),
             current_dir: env::current_dir().map_err(ConfigError::CurrentDirectory)?,
+            environment,
         })
     }
 }
@@ -410,6 +498,7 @@ fn resolve_pkgs_dir(
 fn resolve_configured_runtime(
     configured: &RawRuntimeConfig,
     values: &Values,
+    environment: &Values,
     config_path: &Path,
     resolve_pkgs_dir: bool,
 ) -> Result<ConfiguredRuntimeConfig, ConfigError> {
@@ -418,6 +507,7 @@ fn resolve_configured_runtime(
             "config.pkgs_dir",
             configured.pkgs_dir.as_deref(),
             values,
+            environment,
             |path| ConfigError::RelativePkgsDirectory { path },
         )
         .map_err(|error| map_runtime_path_error(error, config_path))?
@@ -428,6 +518,7 @@ fn resolve_configured_runtime(
         "config.backup_dir",
         configured.backup_dir.as_deref(),
         values,
+        environment,
         |path| ConfigError::RelativeBackupDirectory { path },
     )
     .map_err(|error| map_runtime_path_error(error, config_path))?;
@@ -442,6 +533,7 @@ fn resolve_configured_path<F>(
     name: &str,
     configured: Option<&Path>,
     values: &Values,
+    environment: &Values,
     relative_error: F,
 ) -> Result<Option<PathBuf>, RuntimePathError>
 where
@@ -450,7 +542,7 @@ where
     let Some(path) = configured else {
         return Ok(None);
     };
-    let path = resolve_runtime_path(name, path, values)?;
+    let path = resolve_runtime_path(name, path, values, environment)?;
     if path.is_absolute() {
         Ok(Some(path))
     } else {
@@ -462,9 +554,10 @@ fn resolve_runtime_path(
     name: &str,
     path: &Path,
     values: &Values,
+    environment: &Values,
 ) -> Result<PathBuf, RuntimePathError> {
     let value = path.to_string_lossy();
-    let mut resolver = VariableResolver::new(values);
+    let mut resolver = VariableResolver::new(values, environment);
     resolver
         .interpolate(name, &value)
         .map(PathBuf::from)
@@ -518,7 +611,7 @@ fn resolve_values(
 
     let mut raw = raw_paths.clone();
     raw.extend(configured_variables.clone());
-    let resolved = VariableResolver::new(&raw).resolve_all()?;
+    let resolved = VariableResolver::new(&raw, &context.environment).resolve_all()?;
 
     let mut paths = BTreeMap::new();
     for name in raw_paths.keys() {
@@ -559,14 +652,16 @@ fn resolve_values(
 
 struct VariableResolver<'a> {
     raw: &'a BTreeMap<String, String>,
+    environment: &'a Values,
     resolved: BTreeMap<String, String>,
     resolving: Vec<String>,
 }
 
 impl<'a> VariableResolver<'a> {
-    fn new(raw: &'a BTreeMap<String, String>) -> Self {
+    fn new(raw: &'a BTreeMap<String, String>, environment: &'a Values) -> Self {
         Self {
             raw,
+            environment,
             resolved: BTreeMap::new(),
             resolving: Vec::new(),
         }
@@ -638,6 +733,14 @@ impl<'a> VariableResolver<'a> {
         reference: &str,
     ) -> Result<String, EvaluationError> {
         match reference {
+            name if name.starts_with('$') => {
+                self.environment.get(&name[1..]).cloned().ok_or_else(|| {
+                    EvaluationError::MissingEnvironmentVariable {
+                        variable: variable.to_owned(),
+                        environment: name[1..].to_owned(),
+                    }
+                })
+            }
             name if self.raw.contains_key(name) => self.resolve_variable(name),
             _ => Err(EvaluationError::UnknownReference {
                 variable: variable.to_owned(),
@@ -656,6 +759,10 @@ fn append_fragment(result: &mut String, fragment: &str) {
 }
 
 fn validate_reference(variable: &str, reference: &str) -> Result<(), EvaluationError> {
+    if let Some(environment) = reference.strip_prefix('$') {
+        return validate_environment_reference(variable, environment);
+    }
+
     let mut characters = reference.chars();
     let Some(first) = characters.next() else {
         return Err(EvaluationError::EmptyReference {
@@ -676,6 +783,29 @@ fn validate_reference(variable: &str, reference: &str) -> Result<(), EvaluationE
         return Err(EvaluationError::InvalidReference {
             variable: variable.to_owned(),
             reference: reference.to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_environment_reference(
+    variable: &str,
+    environment: &str,
+) -> Result<(), EvaluationError> {
+    let mut characters = environment.chars();
+    let Some(first) = characters.next() else {
+        return Err(EvaluationError::EmptyEnvironmentReference {
+            variable: variable.to_owned(),
+        });
+    };
+
+    if (!first.is_ascii_alphabetic() && first != '_')
+        || characters.any(|character| !character.is_ascii_alphanumeric() && character != '_')
+    {
+        return Err(EvaluationError::InvalidEnvironmentReference {
+            variable: variable.to_owned(),
+            environment: environment.to_owned(),
         });
     }
 
@@ -840,14 +970,48 @@ impl Error for ConfigError {
 
 #[derive(Debug)]
 pub enum EvaluationError {
-    DuplicateName { name: String },
-    RelativePath { name: String, value: String },
-    EmptyReference { variable: String },
-    InvalidReference { variable: String, reference: String },
-    UnterminatedReference { variable: String },
-    UnknownReference { variable: String, reference: String },
-    UnknownVariable { variable: String },
-    Cycle { variables: Vec<String> },
+    DuplicateName {
+        name: String,
+    },
+    RelativePath {
+        name: String,
+        value: String,
+    },
+    EmptyReference {
+        variable: String,
+    },
+    InvalidReference {
+        variable: String,
+        reference: String,
+    },
+    EmptyEnvironmentReference {
+        variable: String,
+    },
+    InvalidEnvironmentReference {
+        variable: String,
+        environment: String,
+    },
+    MissingEnvironmentVariable {
+        variable: String,
+        environment: String,
+    },
+    NonUnicodeEnvironmentVariable {
+        variable: String,
+        environment: String,
+    },
+    UnterminatedReference {
+        variable: String,
+    },
+    UnknownReference {
+        variable: String,
+        reference: String,
+    },
+    UnknownVariable {
+        variable: String,
+    },
+    Cycle {
+        variables: Vec<String>,
+    },
 }
 
 impl fmt::Display for EvaluationError {
@@ -872,6 +1036,31 @@ impl fmt::Display for EvaluationError {
             } => write!(
                 formatter,
                 "variable '{variable}' contains invalid reference '${{{reference}}}'"
+            ),
+            Self::EmptyEnvironmentReference { variable } => write!(
+                formatter,
+                "variable '{variable}' contains an empty environment reference"
+            ),
+            Self::InvalidEnvironmentReference {
+                variable,
+                environment,
+            } => write!(
+                formatter,
+                "variable '{variable}' contains invalid environment reference '${{$${environment}}}'"
+            ),
+            Self::MissingEnvironmentVariable {
+                variable,
+                environment,
+            } => write!(
+                formatter,
+                "variable '{variable}' references unset environment variable '{environment}'"
+            ),
+            Self::NonUnicodeEnvironmentVariable {
+                variable,
+                environment,
+            } => write!(
+                formatter,
+                "variable '{variable}' references non-Unicode environment variable '{environment}'"
             ),
             Self::UnterminatedReference { variable } => {
                 write!(
