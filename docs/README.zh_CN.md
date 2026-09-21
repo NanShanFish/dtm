@@ -9,8 +9,7 @@ dtm, d(o)t(file)m(anager) 是一个用 Rust 编写的用来在 Unix 上管理 do
 ```bash
 git clone https://github.com/nanshanfish/dtm.git
 cd dtm
-cargo build --release
-cp target/release/dtm /usr/local/bin/
+sudo -E make install
 ```
 
 ## 命令总览

@@ -12,3 +12,6 @@ build-test-inter:
 test-inter: build-test-inter
 	$(CONTAINER_ENGINE) build --file Dockerfile.test-inter --tag $(IMAGE) .
 	$(CONTAINER_ENGINE) run --rm --interactive --tty --init $(IMAGE)
+
+install: build
+	cp ./target/release/dtm /usr/local/bin/

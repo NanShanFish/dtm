@@ -10,8 +10,7 @@ Unix systems.
 ```bash
 git clone https://github.com/nanshanfish/dtm.git
 cd dtm
-cargo build --release
-cp target/release/dtm /usr/local/bin/
+sudo -E make install
 ```
 
 ## Command Overview
